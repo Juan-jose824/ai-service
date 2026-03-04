@@ -236,15 +236,17 @@ function generateDI(structure, processId) {
     };
     const sz = type => NODE_SIZE[type] || NODE_SIZE.task;
 
-    const POOL_X     = 160;
-    const POOL_Y     = 60;
-    const LABEL_W    = 30;
-    const LANE_X     = POOL_X + LABEL_W;
-    const COL_W      = 200;   // px between column centers
-    const ROW_H      = 120;   // px between row centers
-    const LANE_PAD   = 38;    // top+bottom padding inside each lane
-    const START_CX   = LANE_X + 65; // center-x of column 0 within any lane
-    const MAX_PER_ROW = 7;    // wrap to next row after this many nodes
+    const POOL_X      = 160;
+    const POOL_Y      = 60;
+    const LABEL_W     = 30;
+    const LANE_X      = POOL_X + LABEL_W;
+    const COL_W       = 240;   // px between column centers (wider = more breathing room)
+    const ROW_H       = 140;   // px between row centers (taller = more vertical space)
+    const LANE_PAD    = 50;    // top+bottom padding inside each lane
+    const START_CX    = LANE_X + 75; // center-x of column 0 within any lane
+    const MAX_PER_ROW = 7;     // wrap to next row after this many nodes
+    const HW_MARGIN   = 420;   // extra px right of last node reserved for highway tracks
+    const HW_STAGGER  = 42;    // px between adjacent highway tracks (clearly visible gap)
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
@@ -340,7 +342,49 @@ function generateDI(structure, processId) {
     const maxContentX = Math.max(...steps.map(s => {
         const p = pos[s.id]; return p ? p.x + p.w : 0;
     }));
-    const poolW = maxContentX - POOL_X + 120;
+
+    // ── Global highway rank map ─────────────────────────────────
+    // Problem: two hubs (e.g. Ciudadano menu + Brigadista menu) can have
+    // the same lane-gap to their modules, so a gap-based track index gives
+    // BOTH the same X → lines stack on top of each other.
+    //
+    // Solution: assign a GLOBAL rank to every non-adjacent DOWN connection,
+    // sorted by (srcLane, gap). This guarantees each connection gets a
+    // unique track, regardless of how many hubs exist.
+    //
+    // Rank 0 → track at HW_BASE (innermost right),
+    // Rank 1 → HW_BASE + HW_STAGGER, etc.
+
+    const HW_BASE = maxContentX + 40;
+
+    // Collect all non-adjacent DOWN cross-lane edges (laneGap >= 2)
+    const downEdges = [];
+    steps.forEach(step => {
+        const srcRi = roles.indexOf(step.role);
+        (step.next || []).forEach(targetId => {
+            const tgt = stepMap[targetId];
+            if (!tgt) return;
+            const tgtRi = roles.indexOf(tgt.role);
+            const laneGap = tgtRi - srcRi;
+            if (laneGap >= 2) {
+                downEdges.push({ srcId: step.id, tgtId: targetId, srcRi, laneGap });
+            }
+        });
+    });
+
+    // Sort by (srcLane, gap) so connections from the same hub stay grouped
+    // and get consecutive tracks — visually a clean fan per hub.
+    downEdges.sort((a, b) => a.srcRi - b.srcRi || a.laneGap - b.laneGap);
+
+    // Build lookup: "srcId->tgtId" → track X
+    const downHW = new Map();
+    downEdges.forEach((edge, rank) => {
+        downHW.set(`${edge.srcId}->${edge.tgtId}`, HW_BASE + rank * HW_STAGGER);
+    });
+
+    const totalDownTracks = downEdges.length;
+    const requiredRight   = HW_BASE + totalDownTracks * HW_STAGGER + 60;
+    const poolW           = Math.max(requiredRight, maxContentX + HW_MARGIN) - POOL_X;
 
     // ── Helpers ───────────────────────────────────────────────
     const P   = id => pos[id];
@@ -425,19 +469,73 @@ function generateDI(structure, processId) {
                     pts = [[x1, y1], [midX, y1], [midX, y2], [x2, y2]];
                 }
             } else {
-                // ── Cross-lane ────────────────────────────────
-                // Exit right side of source, travel vertically to target lane,
-                // enter at the left of the target node.
-                // Use a fixed "highway" x slightly past the rightmost node to avoid overlaps.
-                const srcLaneRight = LANE_X + poolW - LABEL_W - 20;
-                const crossX = Math.max(x1 + 10, Math.min(srcLaneRight, x2 + 10));
+                // ── Cross-lane ─────────────────────────────────────────────
+                //
+                // Two families of cross-lane connections:
+                //
+                // (A) DOWN — source is above target (srcRi < tgtRi)
+                //     The line exits the RIGHT side of the source, travels to
+                //     a staggered right-side highway, then comes down and enters
+                //     the LEFT side of the target.
+                //     - gap=1 (adjacent):  use midpoint X between source-right
+                //       and target-left for a clean short L-turn.
+                //     - gap≥2 (skipping):  use the RIGHT MARGIN, staggered so
+                //       each distance gets its own track:
+                //       gap=2 → furthest right, gap=N → progressively inward.
+                //       This fans the lines like a staircase, no overlaps.
+                //
+                // (B) UP — source is below target (srcRi > tgtRi)
+                //     These are "return" connections (module end → hub menu).
+                //     The source node is at a UNIQUE column in its lane
+                //     (col 1, 2, 3… depending on how many steps the module has),
+                //     so we use CX(source) as the vertical track — each return
+                //     line naturally travels at a different X with no stacking.
+                //     The line exits right, drops to CX(src), goes UP to target
+                //     row, then enters target from the left.
 
-                pts = [
-                    [x1,     y1],
-                    [crossX, y1],
-                    [crossX, y2],
-                    [x2,     y2],
-                ];
+                const laneGap = Math.abs(tgtRi - srcRi);
+
+                // RIGHT-SIDE staggered highway tracks start at HW_BASE (computed above).
+                // Track 0 (gap=2) = HW_BASE
+                // Track 1 (gap=3) = HW_BASE + HW_STAGGER
+                // Track N (gap=N+2) = HW_BASE + N * HW_STAGGER
+                // Each track is HW_STAGGER px apart — clearly visible in BPMN viewers.
+
+                if (srcRi < tgtRi) {
+                    // ── Going DOWN ────────────────────────────────────────
+                    if (laneGap === 1) {
+                        // Adjacent lane: simple L-turn with midpoint
+                        const midX = Math.round((x1 + x2) / 2);
+                        pts = [
+                            [x1,   y1],
+                            [midX, y1],
+                            [midX, y2],
+                            [x2,   y2],
+                        ];
+                    } else {
+                        // Skipping lanes: look up this connection's pre-assigned
+                        // global rank track. Every connection has a unique track X
+                        // regardless of how many hubs exist in the diagram.
+                        const hw = downHW.get(`${step.id}->${targetId}`) ?? (HW_BASE + (laneGap - 2) * HW_STAGGER);
+                        pts = [
+                            [x1,  y1],
+                            [hw,  y1],
+                            [hw,  y2],
+                            [x2,  y2],
+                        ];
+                    }
+                } else {
+                    // ── Going UP ─────────────────────────────────────────
+                    // Each return line uses CX(source) + small unique offset
+                    // so lines from modules in different columns stay separated.
+                    const hw = CX(step.id) + laneGap * 6;
+                    pts = [
+                        [x1,  y1],
+                        [hw,  y1],
+                        [hw,  y2],
+                        [x2,  y2],
+                    ];
+                }
             }
 
             edges += `      <bpmndi:BPMNEdge id="${edgeId}" bpmnElement="${flowId}">
@@ -485,6 +583,16 @@ REGLAS OBLIGATORIAS:
 4. Usa exclusiveGateway solo para bifurcaciones clave (éxito/fallo, opción A/B).
 5. IDs únicos, cortos, sin espacios ni caracteres especiales.
 6. NUNCA crees referencias circulares en "next" (A→B→A causa error crítico).
+10. NUNCA inventes pasos, gateways ni lanes que no estén en el manual. REGLA ABSOLUTA.
+    CASOS CONCRETOS PROHIBIDOS:
+    ❌ "¿A qué aplicación desea entrar?" — PROHIBIDO si el manual no lo dice.
+    ❌ "¿Qué tipo de usuario eres?" — PROHIBIDO.
+    ❌ "¿Acceder como Ciudadano o Brigadista?" — PROHIBIDO.
+    ❌ Cualquier gateway de selección de portal/rol/aplicación — PROHIBIDO.
+    Si el manual documenta dos tipos de usuario (Ciudadano + Brigadista):
+    → Cada uno tiene su propio lane de startEvent INDEPENDIENTE, sin gateway previo.
+    → El diagrama tiene DOS flujos en paralelo, no uno con bifurcación de entrada.
+    En caso de duda: OMITE el paso. Diagrama incompleto > diagrama con pasos inventados.
 7. El campo "conditions" en gateways es obligatorio si hay más de una salida.
 8. Todos los nodos deben estar conectados — ningún nodo sin "next" salvo endEvent/endEventMessage.
 9. ORDEN del array steps[]: primero el startEvent, luego los nodos del primer lane en orden de flujo, luego los del segundo lane, etc.
