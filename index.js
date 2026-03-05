@@ -14,9 +14,9 @@ const genAI  = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CONFIG = {
     model:       'gemini-2.5-flash',
-    maxPdfChars: 12_000,
+    maxPdfChars: 50_000,
     maxTokens:   65_536,
-    temperature: 0.2,
+    temperature: 0,
     timeout:     120_000,
 };
 
@@ -240,13 +240,12 @@ function generateDI(structure, processId) {
     const POOL_Y      = 60;
     const LABEL_W     = 30;
     const LANE_X      = POOL_X + LABEL_W;
-    const COL_W       = 240;   // px between column centers (wider = more breathing room)
-    const ROW_H       = 140;   // px between row centers (taller = more vertical space)
-    const LANE_PAD    = 50;    // top+bottom padding inside each lane
-    const START_CX    = LANE_X + 75; // center-x of column 0 within any lane
-    const MAX_PER_ROW = 7;     // wrap to next row after this many nodes
+    const COL_W       = 250;   // px between column centers
+    const ROW_H       = 160;   // px between row centers — extra space prevents arc crowding
+    const LANE_PAD    = 55;    // top+bottom padding — arcs live in the top padding zone
+    const START_CX    = LANE_X + 80; // center-x of column 0
+    const MAX_PER_ROW = 5;     // max nodes per row — keeps most lanes to a single clean row
     const HW_MARGIN   = 420;   // extra px right of last node reserved for highway tracks
-    const HW_STAGGER  = 42;    // px between adjacent highway tracks (clearly visible gap)
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
@@ -343,48 +342,108 @@ function generateDI(structure, processId) {
         const p = pos[s.id]; return p ? p.x + p.w : 0;
     }));
 
-    // ── Global highway rank map ─────────────────────────────────
-    // Problem: two hubs (e.g. Ciudadano menu + Brigadista menu) can have
-    // the same lane-gap to their modules, so a gap-based track index gives
-    // BOTH the same X → lines stack on top of each other.
+    // ── Hybrid cross-lane routing system ────────────────────────
     //
-    // Solution: assign a GLOBAL rank to every non-adjacent DOWN connection,
-    // sorted by (srcLane, gap). This guarantees each connection gets a
-    // unique track, regardless of how many hubs exist.
+    // DOWN connections (source lane above target):
+    //   Exit source BOTTOM → drop to src bottom-padding zone →
+    //   travel RIGHT to a dedicated highway track →
+    //   drop vertically to tgt top-padding zone →
+    //   slide LEFT to tgtCX → enter target TOP
     //
-    // Rank 0 → track at HW_BASE (innermost right),
-    // Rank 1 → HW_BASE + HW_STAGGER, etc.
+    //   Tracks are staggered: closest-gap = innermost track (near content),
+    //   furthest-gap = outermost track (further right). Each connection gets
+    //   its own track, clearly visible and separated.
+    //
+    // UP connections (source lane below target):
+    //   Exit source TOP → rise to src top-padding zone →
+    //   travel LEFT to a dedicated left corridor track →
+    //   rise vertically to tgt bottom-padding zone →
+    //   slide RIGHT to tgtCX → enter target BOTTOM
+    //
+    //   Left corridor tracks fan leftward from LANE_X - 5.
+    //   UP connections are typically few (module → menu returns),
+    //   so the narrow left margin accommodates them.
+    //
+    // This gives a clean visual separation:
+    //   Right side  = outgoing fan from hubs (clearly spread out)
+    //   Left side   = return connections (compact, minimal)
+    //   No horizontal segments at node level in any lane.
 
-    const HW_BASE = maxContentX + 40;
+    const HW_BASE    = maxContentX + 40;   // first highway track X (right of all content)
+    const HW_STAGGER = 20;                  // px between highway tracks (compact, still distinct)
 
-    // Collect all non-adjacent DOWN cross-lane edges (laneGap >= 2)
-    const downEdges = [];
-    steps.forEach(step => {
-        const srcRi = roles.indexOf(step.role);
-        (step.next || []).forEach(targetId => {
-            const tgt = stepMap[targetId];
-            if (!tgt) return;
-            const tgtRi = roles.indexOf(tgt.role);
-            const laneGap = tgtRi - srcRi;
-            if (laneGap >= 2) {
-                downEdges.push({ srcId: step.id, tgtId: targetId, srcRi, laneGap });
+    // ── Assign global highway tracks for ALL cross-lane connections ───────
+    //
+    // Both DOWN and UP connections use the RIGHT-SIDE highway.
+    // This keeps ALL cross-lane lines in the visible right margin — no lines
+    // hidden under the pool label.
+    //
+    // Track assignment:
+    //   - All connections sorted by (srcLane, gap_size)
+    //   - Each gets a globally unique track X = HW_BASE + globalRank * HW_STAGGER
+    //   - DOWN connections: closest lane gap → innermost track (smallest X)
+    //   - UP connections: interleaved after DOWN tracks of same source lane
+    //   - This ensures connections from the same hub visually fan out right
+    //     and return connections (UP) also clearly visible and separated.
+
+    const hwXMap     = new Map();  // "srcId->tgtId" → highway track X
+    const downRankMap = new Map(); // "srcId->tgtId" → rank within source (for paddingY)
+    const upRankMap   = new Map(); // "srcId->tgtId" → rank within source (for paddingY)
+    let   globalHWRank = 0;
+
+    {
+        // Collect ALL cross-lane connections (down and up)
+        const allCross = [];
+        steps.forEach(step => {
+            const srcRi = roles.indexOf(step.role);
+            (step.next || []).forEach(targetId => {
+                const tgt = stepMap[targetId];
+                if (!tgt) return;
+                const tgtRi = roles.indexOf(tgt.role);
+                if (tgtRi === srcRi) return;
+                const gap  = Math.abs(tgtRi - srcRi);
+                const dir  = tgtRi > srcRi ? 'down' : 'up';
+                const col  = nodeLocalCol[step.id] ?? 0;
+                allCross.push({ srcId: step.id, tgtId: targetId, srcRi, tgtRi, gap, dir, col });
+            });
+        });
+
+        // Sort: by srcLane → then DOWN before UP → then by gap (closest first)
+        allCross.sort((a, b) =>
+            a.srcRi - b.srcRi ||
+            (a.dir === 'down' ? 0 : 1) - (b.dir === 'down' ? 0 : 1) ||
+            a.gap - b.gap ||
+            a.col - b.col
+        );
+
+        // Assign per-source rank counters (for paddingY staggering)
+        const srcDownCounter = new Map();
+        const srcUpCounter   = new Map();
+
+        allCross.forEach(e => {
+            const key = `${e.srcId}->${e.tgtId}`;
+
+            // Assign highway track
+            hwXMap.set(key, HW_BASE + globalHWRank * HW_STAGGER);
+            globalHWRank++;
+
+            // Assign per-source rank for paddingY staggering
+            if (e.dir === 'down') {
+                const cnt = srcDownCounter.get(e.srcId) || 0;
+                downRankMap.set(key, cnt);
+                srcDownCounter.set(e.srcId, cnt + 1);
+            } else {
+                const cnt = srcUpCounter.get(e.srcId) || 0;
+                upRankMap.set(key, cnt);
+                srcUpCounter.set(e.srcId, cnt + 1);
             }
         });
-    });
+    }
 
-    // Sort by (srcLane, gap) so connections from the same hub stay grouped
-    // and get consecutive tracks — visually a clean fan per hub.
-    downEdges.sort((a, b) => a.srcRi - b.srcRi || a.laneGap - b.laneGap);
-
-    // Build lookup: "srcId->tgtId" → track X
-    const downHW = new Map();
-    downEdges.forEach((edge, rank) => {
-        downHW.set(`${edge.srcId}->${edge.tgtId}`, HW_BASE + rank * HW_STAGGER);
-    });
-
-    const totalDownTracks = downEdges.length;
-    const requiredRight   = HW_BASE + totalDownTracks * HW_STAGGER + 60;
-    const poolW           = Math.max(requiredRight, maxContentX + HW_MARGIN) - POOL_X;
+    // Pool width: accommodate the rightmost highway track
+    const totalTracks = globalHWRank;
+    const requiredW   = HW_BASE + totalTracks * HW_STAGGER + 60;
+    const poolW       = Math.max(requiredW, maxContentX + HW_MARGIN) - POOL_X;
 
     // ── Helpers ───────────────────────────────────────────────
     const P   = id => pos[id];
@@ -438,102 +497,133 @@ function generateDI(structure, processId) {
 
             if (srcRi === tgtRi) {
                 // ── Same lane ─────────────────────────────────
+                //
+                // The lane's top-padding zone (LANE_PAD px above the first row)
+                // is reserved for backward arcs and wrap connectors.
+                // Each arc gets a dedicated vertical slot within that zone
+                // so arcs from different pairs never share the same Y line.
+                //
+                // Arc slots are spaced 12px apart starting from the top:
+                //   slot 0 → laneY + 10
+                //   slot 1 → laneY + 22
+                //   slot 2 → laneY + 34
+                //   ...
+                // We use (srcCol + tgtCol) mod (available slots) to pick a slot,
+                // giving each pair a consistent, spread-out arc height.
+
+                const laneTop = laneY[srcRi];
+                const ARC_SLOT_H = 12;  // px between arc slots
+                const ARC_SLOTS  = Math.floor((LANE_PAD - 10) / ARC_SLOT_H); // how many slots fit
+                const srcCol     = nodeLocalCol[step.id]   ?? 0;
+                const tgtCol     = nodeLocalCol[targetId]  ?? 0;
+
                 if (srcRow === tgtRow && x2 > x1) {
-                    // Forward same row → straight horizontal
+                    // ── Forward, same row → straight horizontal ──────────
                     pts = [[x1, y1], [x2, y2]];
+
                 } else if (srcRow < tgtRow && nodeLocalCol[targetId] === 0) {
-                    // Wrap to next row: go right edge → drop below lane divider → come back left
-                    const dropY = laneY[srcRi] + LANE_PAD + (srcRow + 1) * ROW_H + ROW_H / 2 - ROW_H / 2 - 12;
+                    // ── Row wrap (forward, source last col → next row col 0) ─
+                    // Exit right → travel down the right margin → re-enter left.
+                    // The right margin is between the last column and the pool edge.
+                    // This keeps the path clear of all node content.
+                    const wrapX  = START_CX + (MAX_PER_ROW - 1) * COL_W + 80;  // right of last node
+                    const midY   = laneY[srcRi] + LANE_PAD + (srcRow + 1) * ROW_H; // between the two rows
                     pts = [
-                        [x1,          y1],
-                        [x1 + 18,     y1],
-                        [x1 + 18,     dropY],
-                        [START_CX - 40, dropY],
-                        [START_CX - 40, y2],
-                        [x2,          y2],
+                        [x1,           y1],
+                        [wrapX,        y1],
+                        [wrapX,        midY],
+                        [START_CX - 50, midY],
+                        [START_CX - 50, y2],
+                        [x2,           y2],
                     ];
-                } else if (x2 < x1) {
-                    // Backward (loop) → arc above or below
-                    const arcY = T(step.id) - 20;
+
+                } else if (srcRow === tgtRow && x2 < x1) {
+                    // ── Backward loop within same row ────────────────────
+                    // Arc goes ABOVE the lane, into the top-padding zone.
+                    // Slot is chosen by (srcCol % ARC_SLOTS) to spread arcs out.
+                    const slot   = srcCol % Math.max(1, ARC_SLOTS);
+                    const arcY   = laneTop + 10 + slot * ARC_SLOT_H;
                     pts = [
                         [x1,      y1],
-                        [x1 + 15, y1],
-                        [x1 + 15, arcY],
-                        [x2 - 15, arcY],
-                        [x2 - 15, y2],
+                        [x1 + 12, y1],
+                        [x1 + 12, arcY],
+                        [x2 - 12, arcY],
+                        [x2 - 12, y2],
                         [x2,      y2],
                     ];
+
+                } else if (srcRow > tgtRow) {
+                    // ── Cross-row backward (e.g. row2 → row1) ───────────
+                    // Route via the BOTTOM padding zone to avoid the wrap path.
+                    // Exit right → go to right margin → rise to target row → enter left.
+                    const wrapX = START_CX + (MAX_PER_ROW - 1) * COL_W + 80;
+                    pts = [
+                        [x1,           y1],
+                        [wrapX,        y1],
+                        [wrapX,        y2],
+                        [x2,           y2],
+                    ];
+
                 } else {
-                    // Forward different row, non-zero target col
+                    // ── Forward, different row, non-zero target col ──────
                     const midX = Math.round((x1 + x2) / 2);
                     pts = [[x1, y1], [midX, y1], [midX, y2], [x2, y2]];
                 }
             } else {
-                // ── Cross-lane ─────────────────────────────────────────────
+                // ── Cross-lane — Unified RIGHT-HIGHWAY routing ──────────────
                 //
-                // Two families of cross-lane connections:
+                // ALL cross-lane connections (DOWN and UP) travel through the
+                // RIGHT-SIDE highway zone. Each gets its own unique track X,
+                // so all lines are clearly visible and separated — no bundling.
                 //
-                // (A) DOWN — source is above target (srcRi < tgtRi)
-                //     The line exits the RIGHT side of the source, travels to
-                //     a staggered right-side highway, then comes down and enters
-                //     the LEFT side of the target.
-                //     - gap=1 (adjacent):  use midpoint X between source-right
-                //       and target-left for a clean short L-turn.
-                //     - gap≥2 (skipping):  use the RIGHT MARGIN, staggered so
-                //       each distance gets its own track:
-                //       gap=2 → furthest right, gap=N → progressively inward.
-                //       This fans the lines like a staircase, no overlaps.
+                // DOWN path (source above target):
+                //   Exit source BOTTOM → drop into src bottom-padding slot →
+                //   slide RIGHT to dedicated highway track X →
+                //   drop to tgt top-padding → slide LEFT to tgtCX → enter TOP.
                 //
-                // (B) UP — source is below target (srcRi > tgtRi)
-                //     These are "return" connections (module end → hub menu).
-                //     The source node is at a UNIQUE column in its lane
-                //     (col 1, 2, 3… depending on how many steps the module has),
-                //     so we use CX(source) as the vertical track — each return
-                //     line naturally travels at a different X with no stacking.
-                //     The line exits right, drops to CX(src), goes UP to target
-                //     row, then enters target from the left.
+                // UP path (source below target):
+                //   Exit source TOP → rise into src top-padding slot →
+                //   slide RIGHT to dedicated highway track X →
+                //   rise to tgt bottom-padding → slide LEFT to tgtCX → enter BOTTOM.
+                //
+                // paddingY slots are staggered 12px per rank so multiple connections
+                // from the same source node don't overlap near the source.
 
-                const laneGap = Math.abs(tgtRi - srcRi);
-
-                // RIGHT-SIDE staggered highway tracks start at HW_BASE (computed above).
-                // Track 0 (gap=2) = HW_BASE
-                // Track 1 (gap=3) = HW_BASE + HW_STAGGER
-                // Track N (gap=N+2) = HW_BASE + N * HW_STAGGER
-                // Each track is HW_STAGGER px apart — clearly visible in BPMN viewers.
+                const srcCX     = CX(step.id);
+                const tgtCX     = CX(targetId);
+                const srcBottom = B(step.id);
+                const srcTop    = T(step.id);
+                const tgtBottom = B(targetId);
+                const tgtTop    = T(targetId);
+                const hwX       = hwXMap.get(`${step.id}->${targetId}`) ?? HW_BASE;
 
                 if (srcRi < tgtRi) {
                     // ── Going DOWN ────────────────────────────────────────
-                    if (laneGap === 1) {
-                        // Adjacent lane: simple L-turn with midpoint
-                        const midX = Math.round((x1 + x2) / 2);
-                        pts = [
-                            [x1,   y1],
-                            [midX, y1],
-                            [midX, y2],
-                            [x2,   y2],
-                        ];
-                    } else {
-                        // Skipping lanes: look up this connection's pre-assigned
-                        // global rank track. Every connection has a unique track X
-                        // regardless of how many hubs exist in the diagram.
-                        const hw = downHW.get(`${step.id}->${targetId}`) ?? (HW_BASE + (laneGap - 2) * HW_STAGGER);
-                        pts = [
-                            [x1,  y1],
-                            [hw,  y1],
-                            [hw,  y2],
-                            [x2,  y2],
-                        ];
-                    }
+                    const rank     = downRankMap.get(`${step.id}->${targetId}`) ?? 0;
+                    const padBase  = laneY[srcRi] + laneH[srcRi] - Math.round(LANE_PAD / 2);
+                    const paddingY = padBase - rank * 12;
+                    const tgtPadY  = laneY[tgtRi] + Math.round(LANE_PAD / 2);
+
+                    pts = [
+                        [srcCX,  srcBottom],  // exit source bottom
+                        [srcCX,  paddingY],   // drop into src bottom-padding slot
+                        [hwX,    paddingY],   // slide right to highway
+                        [hwX,    tgtPadY],    // drop to tgt top-padding
+                        [tgtCX,  tgtTop],     // slide left, enter target top
+                    ];
                 } else {
                     // ── Going UP ─────────────────────────────────────────
-                    // Each return line uses CX(source) + small unique offset
-                    // so lines from modules in different columns stay separated.
-                    const hw = CX(step.id) + laneGap * 6;
+                    const rank     = upRankMap.get(`${step.id}->${targetId}`) ?? 0;
+                    const padBase  = laneY[srcRi] + Math.round(LANE_PAD / 2);
+                    const paddingY = padBase + rank * 12;
+                    const tgtPadY  = laneY[tgtRi] + laneH[tgtRi] - Math.round(LANE_PAD / 2);
+
                     pts = [
-                        [x1,  y1],
-                        [hw,  y1],
-                        [hw,  y2],
-                        [x2,  y2],
+                        [srcCX,  srcTop],     // exit source top
+                        [srcCX,  paddingY],   // rise into src top-padding slot
+                        [hwX,    paddingY],   // slide right to highway
+                        [hwX,    tgtPadY],    // rise to tgt bottom-padding
+                        [tgtCX,  tgtBottom],  // slide left, enter target bottom
                     ];
                 }
             }
@@ -554,101 +644,125 @@ ${shapes}${edges}    </bpmndi:BPMNPlane>
 // 5. PROMPT — pide JSON compacto, máx 50 pasos
 // ============================================================
 function buildPrompt(text) {
-    return `Eres un analista de procesos BPMN experto. Analiza el manual y genera un diagrama BPMN profesional en estilo Bizagi.
+    return `Eres un analista de procesos BPMN experto. Analiza el manual y genera un diagrama BPMN en estilo Bizagi.
 
-CONCEPTO CLAVE — LANES = SUB-PROCESOS FUNCIONALES (no roles):
-  Cada lane representa UNA SECCIÓN FUNCIONAL del proceso, siguiendo exactamente cómo
-  está organizado el manual. Ejemplos reales:
-    MAL (por roles):   lanes = ["Ciudadano", "Sistema", "Brigadista"]
-    BIEN (funcional):  lanes = ["Inicio de sesión", "Pre-registro", "Verificar cuenta",
-                                 "Menú principal", "Mis credenciales", "Unidades de salud"]
-  Cada lane debe tener MÁXIMO 8 nodos para que el flujo sea legible en horizontal.
-  Si una sección tiene muchos pasos, divídela en dos lanes (ej: "Registro - parte 1", "Registro - parte 2").
+TU TAREA: leer el manual COMPLETO y modelar TODOS los procesos descritos, sin omitir ninguna sección.
 
-ORDEN LÓGICO DE LOS LANES — MUY IMPORTANTE:
-  El primer lane es siempre el PUNTO DE ENTRADA del proceso (lo que el usuario hace primero).
-  Sigue el orden natural del uso de la aplicación:
-    1. Si hay login → el PRIMER lane es "Inicio de sesión" (con el startEvent ahí)
-    2. Luego el registro o pre-registro (si aplica, como alternativa al login)
-    3. Luego la verificación de cuenta (si aplica)
-    4. Luego el menú principal / acceso a módulos
-    5. Luego cada módulo funcional en su propio lane
-    6. El último lane es siempre "Cerrar sesión"
-  Si el proceso NO tiene login, el primer lane es la primera acción del usuario.
+═══════════════════════════════════════════════════════════
+PASO 1 — ANTES DE GENERAR EL JSON: IDENTIFICA EXHAUSTIVAMENTE
+═══════════════════════════════════════════════════════════
+Lee el manual de principio a fin y lista:
+  A) Todos los tipos de usuario (ej: Ciudadano, Brigadista)
+  B) Para CADA usuario: TODAS las secciones/módulos descritos
+  C) Cada sección → su lane en el diagrama
 
-REGLAS OBLIGATORIAS:
-1. UN SOLO startEvent para todo el diagrama — en el primer lane, primer nodo del array.
-2. Cada lane (sub-proceso) termina con su propio endEvent o endEventMessage.
-3. Los sub-procesos secundarios se conectan desde el flujo principal usando intermediateEvent, NO con startEvent separados.
-4. Usa exclusiveGateway solo para bifurcaciones clave (éxito/fallo, opción A/B).
-5. IDs únicos, cortos, sin espacios ni caracteres especiales.
-6. NUNCA crees referencias circulares en "next" (A→B→A causa error crítico).
-10. NUNCA inventes pasos, gateways ni lanes que no estén en el manual. REGLA ABSOLUTA.
-    CASOS CONCRETOS PROHIBIDOS:
-    ❌ "¿A qué aplicación desea entrar?" — PROHIBIDO si el manual no lo dice.
-    ❌ "¿Qué tipo de usuario eres?" — PROHIBIDO.
-    ❌ "¿Acceder como Ciudadano o Brigadista?" — PROHIBIDO.
-    ❌ Cualquier gateway de selección de portal/rol/aplicación — PROHIBIDO.
-    Si el manual documenta dos tipos de usuario (Ciudadano + Brigadista):
-    → Cada uno tiene su propio lane de startEvent INDEPENDIENTE, sin gateway previo.
-    → El diagrama tiene DOS flujos en paralelo, no uno con bifurcación de entrada.
-    En caso de duda: OMITE el paso. Diagrama incompleto > diagrama con pasos inventados.
-7. El campo "conditions" en gateways es obligatorio si hay más de una salida.
-8. Todos los nodos deben estar conectados — ningún nodo sin "next" salvo endEvent/endEventMessage.
-9. ORDEN del array steps[]: primero el startEvent, luego los nodos del primer lane en orden de flujo, luego los del segundo lane, etc.
+REGLA DE ORO: si el manual describe una sección, DEBE aparecer como lane.
+No omitas ninguna. Si no estás seguro, inclúyela.
+
+═══════════════════════════════════════════════════════════
+REGLA 1 — LENGUAJE TÉCNICO OBLIGATORIO
+═══════════════════════════════════════════════════════════
+Nombres de tareas: QUÉ hace el actor, nunca CÓMO hace clic en la interfaz.
+  ❌ "Presionar 'Continuar'"       → ✅ "Confirmar datos del formulario"
+  ❌ "Dar clic en 'Cerrar sesión'" → ✅ "Cerrar sesión"
+  ❌ "Presionar ícono editar"      → ✅ "Seleccionar registro para editar"
+  ❌ Tocar / Pulsar / Presionar    → ✅ Ingresar / Validar / Seleccionar / Confirmar
+
+═══════════════════════════════════════════════════════════
+REGLA 2 — ESTRUCTURA DE FLUJO (LEY FUNDAMENTAL)
+═══════════════════════════════════════════════════════════
+• endEvent / endEventMessage NUNCA tiene "next" con valores. Siempre "next": []
+• intermediateEvent SIEMPRE tiene exactamente 1 entrada y 1 salida.
+
+Conectar secciones:
+  ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
+  ❌ última_tarea → endEvent → intermediateEvent  (endEvent termina todo, no puede conectar)
+  ❌ intermediateEvent sin ningún nodo apuntando a él (queda flotante, inválido)
+
+Menú / hub con múltiples módulos:
+  ✅ tarea_visualizar_menu → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
+  Cada Evt_ModX → primera tarea de ese módulo
+  Evt_CerrarSesion → tarea cerrar sesión → endEvent
+
+═══════════════════════════════════════════════════════════
+REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
+═══════════════════════════════════════════════════════════
+Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
+
+  1. Inicio de sesión         ← startEvent va aquí
+  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 8 nodos
+  3. Recuperación contraseña  ← si el manual lo describe
+  4. Verificación de cuenta   ← si el manual lo describe
+  5. Menú principal           ← siempre presente
+  6. [Un lane por cada módulo listado en el menú]
+  7. Cerrar sesión            ← siempre el último
+
+Si hay DOS tipos de usuario → DOS bloques de lanes independientes, cada uno con su startEvent.
+NO crear gateway de selección de usuario/portal — son flujos separados.
+
+TODOS los módulos del menú deben tener su propio lane.
+Si el menú lista 6 módulos → 6 lanes de módulos. No resumir en uno solo.
+
+═══════════════════════════════════════════════════════════
+REGLA 4 — NO INVENTAR
+═══════════════════════════════════════════════════════════
+Solo incluye lo que el manual describe explícitamente.
+  ❌ Gateways de selección de rol/tipo de usuario — PROHIBIDO
+  ❌ Lanes o pasos no mencionados en el manual — PROHIBIDO
+  En caso de duda: omite el paso. Diagrama incompleto > diagrama con pasos falsos.
+
+═══════════════════════════════════════════════════════════
+REGLA 5 — REGLAS TÉCNICAS
+═══════════════════════════════════════════════════════════
+• UN startEvent por tipo de usuario, siempre en su lane de inicio.
+• IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
+• NUNCA referencias circulares directas: A → B → A
+• "conditions" obligatorio en exclusiveGateway con más de una salida.
+• Máximo 8 nodos por lane. Si hay más → dividir: "Sección - Parte 1", "Sección - Parte 2"
+• steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
 
 TIPOS DE NODO:
-  startEvent            → UN solo inicio para todo el proceso (círculo verde)
-  endEvent              → Fin de una sección o del proceso completo (círculo rojo)
-  endEventMessage       → Fin con confirmación al usuario — "operación exitosa" (círculo rojo con sobre)
-  userTask              → Acción que realiza el usuario (persona)
-  serviceTask           → Llamada a servicio externo o API (engranajes)
-  scriptTask            → Validación o procesamiento interno del sistema (script)
-  exclusiveGateway      → Decisión binaria o múltiple (rombo con X)
-  intermediateEvent     → Marca el inicio de un módulo o sub-sección (círculo doble vacío)
-  intermediateEventMessage → Envío/recepción de notificación dentro del flujo (círculo doble con sobre)
+  startEvent               → Inicio del proceso. Solo uno por flujo de usuario.
+  endEvent                 → Fin de sección (sin notificación). "next": [] siempre.
+  endEventMessage          → Fin con notificación al usuario. "next": [] siempre.
+  userTask                 → Acción del usuario: Ingresar, Seleccionar, Confirmar, Revisar...
+  serviceTask              → Llamada a sistema externo o API.
+  scriptTask               → Validación o procesamiento interno del sistema.
+  exclusiveGateway         → Decisión (rombo). Requiere "conditions" con etiqueta por salida.
+  intermediateEvent        → Conector entre secciones / inicio de módulo. 1 entrada, 1 salida.
+  intermediateEventMessage → Notificación/mensaje en el flujo (email, código, alerta).
 
-PATRÓN DEL DIAGRAMA PROFESIONAL (síguelo):
-  startEvent → tarea(s) del lane 1 → endEvent/intermediateEvent de conexión
-  intermediateEvent → tarea(s) del lane 2 → endEvent
-  ... (un lane por cada sección funcional del manual)
-  
-  Cuando el proceso tiene un menú/hub central:
-  intermediateEvent("Módulos") → sale hacia varios intermediateEvent de sección
-  Cada sección tiene su propio endEvent
-
-FORMATO DE RESPUESTA — responde ÚNICAMENTE con esto:
-
+═══════════════════════════════════════════════════════════
+EJEMPLO DE ESTRUCTURA CORRECTA (estructura, no contenido real)
+═══════════════════════════════════════════════════════════
 [MD_START]
-**Lanes (sub-procesos):** lista de secciones funcionales identificadas
+**Lanes:** lista completa de secciones identificadas
 **Pasos totales:** número
-**Flujo general:** descripción de 2-3 líneas del proceso
+**Flujo general:** 2-3 líneas
 [MD_END]
 [JSON_START]
 {
-  "roles": ["Pre-registro", "Verificar contraseña", "Inicio de sesión y menú", "Módulo A", "Módulo B"],
+  "roles": ["Inicio de sesión", "Pre-registro", "Verificación de cuenta", "Menú principal", "Módulo A", "Módulo B", "Cerrar sesión"],
   "steps": [
-    { "id": "Start_Proceso", "name": "Inicio del proceso", "type": "startEvent", "role": "Pre-registro", "next": ["Task_Paso1"] },
-    { "id": "Task_Paso1", "name": "Completar formulario", "type": "userTask", "role": "Pre-registro", "next": ["Script_Validar"] },
-    { "id": "Script_Validar", "name": "Validar datos", "type": "scriptTask", "role": "Pre-registro", "next": ["GW_Valido"] },
-    { "id": "GW_Valido", "name": "¿Datos válidos?", "type": "exclusiveGateway", "role": "Pre-registro", "next": ["Evt_SiguienteLane", "Task_Error"], "conditions": {"Evt_SiguienteLane": "Sí", "Task_Error": "No"} },
-    { "id": "Task_Error", "name": "Mostrar error y reintentar", "type": "userTask", "role": "Pre-registro", "next": ["Task_Paso1"] },
-    { "id": "Evt_SiguienteLane", "name": "Verificación de cuenta", "type": "intermediateEvent", "role": "Verificar contraseña", "next": ["Task_IngresarCodigo"] },
-    { "id": "Task_IngresarCodigo", "name": "Ingresar código recibido", "type": "userTask", "role": "Verificar contraseña", "next": ["End_Verificacion"] },
-    { "id": "End_Verificacion", "name": "Verificación completa", "type": "endEventMessage", "role": "Verificar contraseña", "next": [] },
-    { "id": "Evt_Login", "name": "Inicio de sesión", "type": "intermediateEvent", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
-    { "id": "Task_Credenciales", "name": "Ingresar credenciales", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Script_ValidarLogin"] },
-    { "id": "Script_ValidarLogin", "name": "Validar credenciales", "type": "scriptTask", "role": "Inicio de sesión y menú", "next": ["GW_Login"] },
-    { "id": "GW_Login", "name": "¿Login exitoso?", "type": "exclusiveGateway", "role": "Inicio de sesión y menú", "next": ["Evt_Modulos", "Task_ErrorLogin"], "conditions": {"Evt_Modulos": "Sí", "Task_ErrorLogin": "No"} },
-    { "id": "Task_ErrorLogin", "name": "Mostrar error de credenciales", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
-    { "id": "Evt_Modulos", "name": "Módulos del sistema", "type": "intermediateEvent", "role": "Inicio de sesión y menú", "next": ["Evt_ModuloA", "Evt_ModuloB", "End_CerrarSesion"] },
-    { "id": "End_CerrarSesion", "name": "Cerrar sesión", "type": "endEvent", "role": "Inicio de sesión y menú", "next": [] },
-    { "id": "Evt_ModuloA", "name": "Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
-    { "id": "Task_AccionA", "name": "Realizar acción A", "type": "userTask", "role": "Módulo A", "next": ["End_ModuloA"] },
-    { "id": "End_ModuloA", "name": "Operación A completada", "type": "endEventMessage", "role": "Módulo A", "next": [] },
-    { "id": "Evt_ModuloB", "name": "Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
-    { "id": "Task_AccionB", "name": "Realizar acción B", "type": "userTask", "role": "Módulo B", "next": ["End_ModuloB"] },
-    { "id": "End_ModuloB", "name": "Operación B completada", "type": "endEventMessage", "role": "Módulo B", "next": [] }
+    { "id": "Start_Login", "name": "Iniciar proceso", "type": "startEvent", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
+    { "id": "Task_Credenciales", "name": "Ingresar credenciales de acceso", "type": "userTask", "role": "Inicio de sesión", "next": ["Script_ValidarLogin"] },
+    { "id": "Script_ValidarLogin", "name": "Validar credenciales", "type": "scriptTask", "role": "Inicio de sesión", "next": ["GW_Login"] },
+    { "id": "GW_Login", "name": "¿Autenticación exitosa?", "type": "exclusiveGateway", "role": "Inicio de sesión", "next": ["Evt_Menu", "Task_ErrorLogin"], "conditions": {"Evt_Menu": "Sí", "Task_ErrorLogin": "No"} },
+    { "id": "Task_ErrorLogin", "name": "Mostrar error de autenticación", "type": "userTask", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
+    { "id": "Evt_PreRegistro", "name": "Iniciar pre-registro", "type": "intermediateEvent", "role": "Pre-registro", "next": ["Task_LlenarFormulario"] },
+    { "id": "Task_LlenarFormulario", "name": "Completar formulario de registro", "type": "userTask", "role": "Pre-registro", "next": ["End_PreRegistro"] },
+    { "id": "End_PreRegistro", "name": "Pre-registro completado", "type": "endEvent", "role": "Pre-registro", "next": [] },
+    { "id": "Evt_Menu", "name": "Acceso al menú principal", "type": "intermediateEvent", "role": "Menú principal", "next": ["Task_VerMenu"] },
+    { "id": "Task_VerMenu", "name": "Visualizar opciones del menú", "type": "userTask", "role": "Menú principal", "next": ["Evt_ModuloA", "Evt_ModuloB", "Evt_CerrarSesion"] },
+    { "id": "Evt_ModuloA", "name": "Iniciar Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
+    { "id": "Task_AccionA", "name": "Ejecutar acción del módulo A", "type": "userTask", "role": "Módulo A", "next": ["End_ModuloA"] },
+    { "id": "End_ModuloA", "name": "Módulo A completado", "type": "endEventMessage", "role": "Módulo A", "next": [] },
+    { "id": "Evt_ModuloB", "name": "Iniciar Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
+    { "id": "Task_AccionB", "name": "Ejecutar acción del módulo B", "type": "userTask", "role": "Módulo B", "next": ["End_ModuloB"] },
+    { "id": "End_ModuloB", "name": "Módulo B completado", "type": "endEventMessage", "role": "Módulo B", "next": [] },
+    { "id": "Evt_CerrarSesion", "name": "Iniciar cierre de sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_ConfirmarCierre"] },
+    { "id": "Task_ConfirmarCierre", "name": "Confirmar cierre de sesión", "type": "userTask", "role": "Cerrar sesión", "next": ["End_SesionCerrada"] },
+    { "id": "End_SesionCerrada", "name": "Sesión cerrada exitosamente", "type": "endEventMessage", "role": "Cerrar sesión", "next": [] }
   ]
 }
 [JSON_END]
@@ -656,7 +770,6 @@ FORMATO DE RESPUESTA — responde ÚNICAMENTE con esto:
 MANUAL A ANALIZAR:
 ${text}`;
 }
-
 // ============================================================
 // 6. ENDPOINT PRINCIPAL
 // ============================================================
@@ -664,12 +777,12 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Archivo no recibido.' });
 
-        // Extraer texto: inicio del manual (roles/contexto) + final (últimos pasos)
+        // Extraer texto completo del PDF — sin chunking, sin huecos.
+        // Gemini 2.5 Flash tiene ventana de 1M tokens; un manual de 30 páginas
+        // es ~5,000 tokens, completamente dentro del límite.
         const pdfData    = await pdf(req.file.buffer);
         const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
-        const chunkA     = rawText.substring(0, 9_000);
-        const chunkB     = rawText.substring(Math.max(0, rawText.length - 3_000));
-        const manualText = (chunkA + ' [...] ' + chunkB).substring(0, CONFIG.maxPdfChars);
+        const manualText = rawText.substring(0, CONFIG.maxPdfChars);
 
         if (manualText.length < 100) {
             return res.status(400).json({ error: 'El PDF no contiene texto extraíble.' });
@@ -742,6 +855,81 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
         if (!structure.roles?.length || !structure.steps?.length) {
             throw new Error('Respuesta de Gemini sin roles o pasos válidos.');
         }
+
+        // ── Post-procesado: corregir errores comunes del modelo ─────────────
+        const stepMap_v = Object.fromEntries(structure.steps.map(s => [s.id, s]));
+
+        // FIX 1: endEvent/endEventMessage con "next" no vacío
+        // Si un endEvent apunta a un intermediateEvent, eliminar ese next del endEvent.
+        // La conexión correcta es: el task ANTERIOR al endEvent → intermediateEvent.
+        structure.steps.forEach(step => {
+            if (step.type === 'endEvent' || step.type === 'endEventMessage') {
+                if (step.next && step.next.length > 0) {
+                    console.warn(`FIX: endEvent "${step.id}" tenía next=[${step.next}] — se elimina`);
+                    step.next = [];
+                }
+            }
+        });
+
+        // FIX 2: intermediateEvent sin entrada (flotante)
+        // Si un intermediateEvent no tiene ningún nodo que apunte a él,
+        // busca si algún endEvent lo apuntaba antes del fix y reconecta desde el
+        // predecessor lógico (el nodo que apuntaba al endEvent).
+        const allNextIds = new Set(structure.steps.flatMap(s => s.next || []));
+        structure.steps.forEach(step => {
+            if ((step.type === 'intermediateEvent' || step.type === 'intermediateEventMessage')
+                && !allNextIds.has(step.id)) {
+                // Find a predecessor: any step in the same or previous role that has no next connection
+                // to this event. Try to connect from the last step of the previous role.
+                const myRoleIdx = structure.roles.indexOf(step.role);
+                if (myRoleIdx > 0) {
+                    const prevRole = structure.roles[myRoleIdx - 1];
+                    const prevSteps = structure.steps.filter(s => s.role === prevRole);
+                    // The last "end" step or last task in prevRole
+                    const lastPrev = prevSteps.filter(s =>
+                        s.type === 'endEvent' || s.type === 'endEventMessage' || s.type === 'userTask' || s.type === 'serviceTask' || s.type === 'scriptTask'
+                    ).pop();
+                    if (lastPrev && !lastPrev.next?.includes(step.id)) {
+                        // If lastPrev is an endEvent, convert it back to a task or just add the connection
+                        if (lastPrev.type === 'endEvent' || lastPrev.type === 'endEventMessage') {
+                            // Change the endEvent to a task that flows forward
+                            console.warn(`FIX: Converting end "${lastPrev.id}" to userTask to connect to floating "${step.id}"`);
+                            lastPrev.type = 'userTask';
+                            lastPrev.next = [step.id];
+                        } else {
+                            console.warn(`FIX: Adding connection ${lastPrev.id} → ${step.id} (was floating)`);
+                            lastPrev.next = [...(lastPrev.next || []), step.id];
+                        }
+                    }
+                }
+            }
+        });
+
+        // FIX 3: Lenguaje informal en nombres de tareas
+        const informalMap = [
+            [/^presionar?\s+/i,   'Seleccionar '],
+            [/^dar\s+clic\s+/i,   'Seleccionar '],
+            [/^hacer?\s+clic\s+/i,'Seleccionar '],
+            [/^pulsar?\s+/i,      'Activar '],
+            [/^tocar?\s+/i,       'Seleccionar '],
+            [/clic/gi,        ''],
+            [/botón/gi,       'opción'],
+            [/boton/gi,       'opción'],
+        ];
+        structure.steps.forEach(step => {
+            if (step.name) {
+                let name = step.name;
+                informalMap.forEach(([pattern, replacement]) => {
+                    name = name.replace(pattern, replacement);
+                });
+                // Clean up extra spaces
+                name = name.replace(/\s{2,}/g, ' ').trim();
+                if (name !== step.name) {
+                    console.warn(`FIX lenguaje: "${step.name}" → "${name}"`);
+                    step.name = name;
+                }
+            }
+        });
 
         // Validar que los roles de cada step existen en la lista de roles
         structure.steps.forEach(step => {
