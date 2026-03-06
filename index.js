@@ -545,81 +545,292 @@ ${wpt(pts)}
 // 5. PROMPT — pide JSON compacto, máx 50 pasos
 // ============================================================
 function buildPrompt(text) {
-    return `Eres un analista de procesos BPMN experto. Analiza el manual y genera un diagrama BPMN en estilo Bizagi.
+    return `ROL DEL MODELO
 
-TU TAREA: leer el manual COMPLETO y modelar TODOS los procesos descritos, sin omitir ninguna sección.
+Actúa como arquitecto senior de procesos especializado en BPMN 2.0, arquitectura de sistemas y análisis funcional de plataformas digitales.
 
-═══════════════════════════════════════════════════════════
-PASO 1 — ANTES DE GENERAR EL JSON: IDENTIFICA EXHAUSTIVAMENTE
-═══════════════════════════════════════════════════════════
-Lee el manual de principio a fin y lista:
-  A) Todos los tipos de usuario (ej: Ciudadano, Brigadista)
-  B) Para CADA usuario: TODAS las secciones/módulos descritos
-  C) Cada sección → su lane en el diagrama
+Tu tarea es analizar manuales de usuario, documentación funcional o descripciones operativas de sistemas y convertirlos en modelos BPMN claros, consistentes y técnicamente correctos.
 
-REGLA DE ORO: si el manual describe una sección, DEBE aparecer como lane.
-No omitas ninguna. Si no estás seguro, inclúyela.
+El objetivo es generar modelos que permitan comprender:
 
-═══════════════════════════════════════════════════════════
-REGLA 1 — LENGUAJE TÉCNICO OBLIGATORIO
-═══════════════════════════════════════════════════════════
-Nombres de tareas: QUÉ hace el actor, nunca CÓMO hace clic en la interfaz.
-  ❌ "Presionar 'Continuar'"       → ✅ "Confirmar datos del formulario"
-  ❌ "Dar clic en 'Cerrar sesión'" → ✅ "Cerrar sesión"
-  ❌ "Presionar ícono editar"      → ✅ "Seleccionar registro para editar"
-  ❌ Tocar / Pulsar / Presionar    → ✅ Ingresar / Validar / Seleccionar / Confirmar
+• cómo funciona la plataforma
+• qué actores participan
+• qué sistemas intervienen
+• cómo se conectan los procesos
 
-═══════════════════════════════════════════════════════════
-REGLA 2 — ESTRUCTURA DE FLUJO (LEY FUNDAMENTAL)
-═══════════════════════════════════════════════════════════
+Los diagramas deben ser comprensibles para analistas de procesos, arquitectos de sistemas y equipos técnicos.
+
+Evita diagramas confusos, actividades ambiguas o flujos cruzados.
+
+------------------------------------------------------------
+
+OBJETIVO DEL ANÁLISIS
+
+A partir del documento debes identificar:
+
+• procesos del sistema
+• módulos funcionales
+• roles de usuario
+• sistemas involucrados
+• integraciones entre sistemas
+• APIs o servicios
+• etapas del proceso
+
+Después debes generar un modelo BPMN estructurado.
+
+------------------------------------------------------------
+
+FASE 0 — ANÁLISIS ARQUITECTÓNICO DE LA PLATAFORMA
+
+Antes de generar cualquier proceso debes analizar la estructura del sistema.
+
+0.1 MÓDULOS DEL SISTEMA
+
+Identifica los módulos funcionales principales.
+
+Ejemplo:
+
+Registro de usuarios
+Gestión de citas
+Credencialización
+Administración
+Activación de servicios
+Soporte
+Reportes
+
+Cada módulo agrupa procesos relacionados.
+
+------------------------------------------------------------
+
+0.2 ROLES DEL SISTEMA
+
+Identifica los roles que interactúan con la plataforma.
+
+Ejemplo:
+
+Usuario
+Operador
+Administrador
+Call Center
+Sistema automático
+Sistema externo
+
+Los roles representan quién ejecuta cada actividad.
+
+------------------------------------------------------------
+
+0.3 PROCESOS POR MÓDULO
+
+Dentro de cada módulo identifica los procesos que lo componen.
+
+Ejemplo:
+
+Módulo: Gestión de citas
+
+Consultar disponibilidad
+Asignar cita
+Confirmar cita
+Modificar cita
+Cancelar cita
+
+------------------------------------------------------------
+
+0.4 SISTEMAS INVOLUCRADOS
+
+Identifica los sistemas o plataformas que participan en el flujo.
+
+Ejemplo:
+
+Sistema de Registro
+Sistema de Citas
+Sistema de Credencialización
+Sistema Financiero
+Sistema de Soporte
+Sistema de Notificaciones
+
+------------------------------------------------------------
+
+0.5 INTEGRACIONES ENTRE SISTEMAS
+
+Detecta cuando un sistema consulta o envía información a otro.
+
+Ejemplo:
+
+API validación de usuario
+API consulta de citas
+API activación de credencial
+API confirmación de entrega
+
+Estas integraciones se representarán como Service Tasks.
+
+------------------------------------------------------------
+
+FASE 1 — IDENTIFICACIÓN DEL PROCESO PRINCIPAL
+
+Define el proceso principal descrito en el manual.
+
+Ejemplo:
+
+Proceso de credencialización
+Proceso de registro de usuario
+Proceso de activación de servicio
+Proceso de gestión de citas
+
+------------------------------------------------------------
+
+FASE 2 — IDENTIFICACIÓN DE SUBPROCESOS
+
+Si el manual describe varias etapas o módulos dentro del proceso principal, conviértelos en subprocesos.
+
+Ejemplo:
+
+Proceso: Credencialización
+
+Subprocesos:
+
+Pre-registro
+Validación de información
+Gestión de citas
+Entrega de credencial
+Activación
+Soporte y reposición
+
+REGLA
+
+Si un módulo contiene más de 7 actividades, modelarlo como subproceso.
+
+Si contiene menos actividades, usar tareas normales.
+
+------------------------------------------------------------
+
+FASE 3 — DEFINICIÓN DE ETAPAS DEL PROCESO
+
+Divide el proceso en etapas funcionales.
+
+Las etapas se representarán como lanes.
+
+Ejemplo:
+
+Pre-registro
+Validación
+Gestión de citas
+Entrega
+Activación
+Soporte
+
+Cada etapa debe contener preferentemente entre 3 y 7 actividades.
+
+------------------------------------------------------------
+
+FASE 4 — MODELO HÍBRIDO DE RESPONSABILIDADES
+
+El BPMN debe organizarse de la siguiente forma:
+
+LANES
+
+Representan etapas del proceso.
+
+RESPONSABLE
+
+Cada tarea debe indicar el rol responsable.
+
+Ejemplo:
+
+Registrar solicitud
+Responsable: Usuario
+
+SISTEMA
+
+Cada tarea puede indicar el sistema que ejecuta la acción.
+
+Ejemplo:
+
+Validar datos
+Sistema: Sistema de Registro
+
+------------------------------------------------------------
+
+FASE 5 — ELEMENTOS BPMN
+
+Usar correctamente:
+
+Start Event
+End Event
+User Task
+System Task
+Service Task
+Exclusive Gateway (XOR)
+
+Ejemplos:
+
+User Task
+Registrar solicitud
+
+System Task
+Validar información
+
+Service Task
+Consultar API de usuarios
+
+Gateway
+¿Datos válidos?
+
+Cada gateway debe tener condiciones claras.
+
+------------------------------------------------------------
+
+FASE 6 — REGLAS DE DISEÑO DEL DIAGRAMA
+
+El flujo debe avanzar de izquierda a derecha.
+
+Evitar cruces de líneas.
+
+Cada tarea debe representar una acción del proceso.
+
+No describir acciones de interfaz como:
+
+hacer clic
+presionar botón
+seleccionar menú
+
+Usar acciones del proceso:
+
+Registrar solicitud
+Validar información
+Confirmar registro
+
+------------------------------------------------------------
+
+FASE 7 — REPRESENTACIÓN DE APIs
+
+Las integraciones deben representarse como Service Tasks.
+
+Ejemplo:
+
+API Consulta de Usuario
+API Consulta de Citas
+API Activación de Credencial
+API Confirmación de Entrega
+
+------------------------------------------------------------
+
+REGLA CRÍTICA
+
+No inventar procesos que el documento no describa.
+
+Sin embargo, puedes inferir validaciones o decisiones cuando el flujo lo implique para mantener coherencia del proceso.
+
+------------------------------------------------------------
+
+REGLAS TÉCNICAS OBLIGATORIAS PARA EL JSON
+
 • endEvent / endEventMessage NUNCA tiene "next" con valores. Siempre "next": []
 • intermediateEvent SIEMPRE tiene exactamente 1 entrada y 1 salida.
-
-Conectar secciones:
-  ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
-  ❌ última_tarea → endEvent → intermediateEvent  (endEvent termina todo, no puede conectar)
-  ❌ intermediateEvent sin ningún nodo apuntando a él (queda flotante, inválido)
-
-Menú / hub con múltiples módulos:
-  ✅ tarea_visualizar_menu → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
-  Cada Evt_ModX → primera tarea de ese módulo
-  Evt_CerrarSesion → tarea cerrar sesión → endEvent
-
-═══════════════════════════════════════════════════════════
-REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
-═══════════════════════════════════════════════════════════
-Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
-
-  1. Inicio de sesión         ← startEvent va aquí
-  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 6 nodos
-  3. Recuperación contraseña  ← si el manual lo describe
-  4. Verificación de cuenta   ← si el manual lo describe
-  5. Menú principal           ← siempre presente
-  6. [Un lane por cada módulo listado en el menú]
-  7. Cerrar sesión            ← siempre el último
-
-Si hay DOS tipos de usuario → DOS bloques de lanes independientes, cada uno con su startEvent.
-NO crear gateway de selección de usuario/portal — son flujos separados.
-
-TODOS los módulos del menú deben tener su propio lane.
-Si el menú lista 6 módulos → 6 lanes de módulos. No resumir en uno solo.
-
-═══════════════════════════════════════════════════════════
-REGLA 4 — NO INVENTAR
-═══════════════════════════════════════════════════════════
-Solo incluye lo que el manual describe explícitamente.
-  ❌ Gateways de selección de rol/tipo de usuario — PROHIBIDO
-  ❌ Lanes o pasos no mencionados en el manual — PROHIBIDO
-  En caso de duda: omite el paso. Diagrama incompleto > diagrama con pasos falsos.
-
-═══════════════════════════════════════════════════════════
-REGLA 5 — REGLAS TÉCNICAS
-═══════════════════════════════════════════════════════════
 • UN startEvent por tipo de usuario, siempre en su lane de inicio.
 • IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
 • NUNCA referencias circulares directas: A → B → A
 • "conditions" obligatorio en exclusiveGateway con más de una salida.
-• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2". Nunca más de 5 nodos en un mismo lane. Esta regla es ABSOLUTA.
+• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2".
 • steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
 
 TIPOS DE NODO:
@@ -633,37 +844,27 @@ TIPOS DE NODO:
   intermediateEvent        → Conector entre secciones / inicio de módulo. 1 entrada, 1 salida.
   intermediateEventMessage → Notificación/mensaje en el flujo (email, código, alerta).
 
-═══════════════════════════════════════════════════════════
-EJEMPLO DE ESTRUCTURA CORRECTA (estructura, no contenido real)
-═══════════════════════════════════════════════════════════
+------------------------------------------------------------
+
+FORMATO DE SALIDA OBLIGATORIO
+
 [MD_START]
-**Lanes:** lista completa de secciones identificadas
+**Módulos identificados:** lista
+**Roles detectados:** lista
+**Sistemas involucrados:** lista
+**Integraciones detectadas:** lista
+**APIs identificadas:** lista
+**Etapas del proceso:** lista
 **Pasos totales:** número
 **Flujo general:** 2-3 líneas
 [MD_END]
 [JSON_START]
 {
-  "roles": ["Inicio de sesión", "Pre-registro", "Verificación de cuenta", "Menú principal", "Módulo A", "Módulo B", "Cerrar sesión"],
+  "roles": ["Etapa 1", "Etapa 2", "..."],
   "steps": [
-    { "id": "Start_Login", "name": "Iniciar proceso", "type": "startEvent", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
-    { "id": "Task_Credenciales", "name": "Ingresar credenciales de acceso", "type": "userTask", "role": "Inicio de sesión", "next": ["Script_ValidarLogin"] },
-    { "id": "Script_ValidarLogin", "name": "Validar credenciales", "type": "scriptTask", "role": "Inicio de sesión", "next": ["GW_Login"] },
-    { "id": "GW_Login", "name": "¿Autenticación exitosa?", "type": "exclusiveGateway", "role": "Inicio de sesión", "next": ["Evt_Menu", "Task_ErrorLogin"], "conditions": {"Evt_Menu": "Sí", "Task_ErrorLogin": "No"} },
-    { "id": "Task_ErrorLogin", "name": "Mostrar error de autenticación", "type": "userTask", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
-    { "id": "Evt_PreRegistro", "name": "Iniciar pre-registro", "type": "intermediateEvent", "role": "Pre-registro", "next": ["Task_LlenarFormulario"] },
-    { "id": "Task_LlenarFormulario", "name": "Completar formulario de registro", "type": "userTask", "role": "Pre-registro", "next": ["End_PreRegistro"] },
-    { "id": "End_PreRegistro", "name": "Pre-registro completado", "type": "endEvent", "role": "Pre-registro", "next": [] },
-    { "id": "Evt_Menu", "name": "Acceso al menú principal", "type": "intermediateEvent", "role": "Menú principal", "next": ["Task_VerMenu"] },
-    { "id": "Task_VerMenu", "name": "Visualizar opciones del menú", "type": "userTask", "role": "Menú principal", "next": ["Evt_ModuloA", "Evt_ModuloB", "Evt_CerrarSesion"] },
-    { "id": "Evt_ModuloA", "name": "Iniciar Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
-    { "id": "Task_AccionA", "name": "Ejecutar acción del módulo A", "type": "userTask", "role": "Módulo A", "next": ["End_ModuloA"] },
-    { "id": "End_ModuloA", "name": "Módulo A completado", "type": "endEventMessage", "role": "Módulo A", "next": [] },
-    { "id": "Evt_ModuloB", "name": "Iniciar Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
-    { "id": "Task_AccionB", "name": "Ejecutar acción del módulo B", "type": "userTask", "role": "Módulo B", "next": ["End_ModuloB"] },
-    { "id": "End_ModuloB", "name": "Módulo B completado", "type": "endEventMessage", "role": "Módulo B", "next": [] },
-    { "id": "Evt_CerrarSesion", "name": "Iniciar cierre de sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_ConfirmarCierre"] },
-    { "id": "Task_ConfirmarCierre", "name": "Confirmar cierre de sesión", "type": "userTask", "role": "Cerrar sesión", "next": ["End_SesionCerrada"] },
-    { "id": "End_SesionCerrada", "name": "Sesión cerrada exitosamente", "type": "endEventMessage", "role": "Cerrar sesión", "next": [] }
+    { "id": "Start_Xxx", "name": "Nombre", "type": "startEvent", "role": "Etapa 1", "next": ["Task_Xxx"] },
+    { "id": "Task_Xxx", "name": "Nombre", "type": "userTask", "role": "Etapa 1", "next": ["End_Xxx"] },
+    { "id": "End_Xxx", "name": "Nombre", "type": "endEvent", "role": "Etapa 1", "next": [] }
   ]
 }
 [JSON_END]
