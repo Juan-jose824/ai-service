@@ -127,15 +127,16 @@ function assignRows(steps, nodeColumn, roles) {
 //             exclusiveGateway,
 //             intermediateEvent, intermediateEventMessage
 // ============================================================
-function generateLogic(structure, processId) {
+function generateLogic(structure, processId, lanePrefix = '') {
     const { roles, steps } = structure;
 
     const lanes = roles.map((role, idx) => {
+        const laneId = `Lane_${lanePrefix}${idx}`;
         const refs = steps
             .filter(s => s.role === role)
             .map(s => `        <flowNodeRef>${s.id}</flowNodeRef>`)
             .join('\n');
-        return `      <lane id="Lane_${idx}" name="${xmlEscape(role)}">\n${refs}\n      </lane>`;
+        return `      <lane id="${laneId}" name="${xmlEscape(role)}">\n${refs}\n      </lane>`;
     }).join('\n');
 
     const elements = steps.map(step => {
@@ -218,9 +219,16 @@ ${sequences}
 //  • Esto elimina el problema de nodos "empujados" lejos a la derecha
 //    por el algoritmo global.
 // ============================================================
-function generateDI(structure, processId) {
+function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
+    const POOL_ID   = poolOpts.poolId   ?? 'Participant_1';
+    const POOL_NAME = poolOpts.poolName ?? 'Proceso de Negocio';
+    const POOL_Y    = poolOpts.poolY    ?? 60;
+    const LANE_PFX  = POOL_ID === 'Participant_1' ? '' : 'B';
+    const COLLAB_ID = POOL_ID === 'Participant_1' ? 'Collaboration_1' : 'Collaboration_2';
+    const DIAG_ID   = POOL_ID === 'Participant_1' ? 'BPMNDiagram_1'   : 'BPMNDiagram_2';
 
+    // ── Node dimensions ────────────────────────────────────────
     const NODE_SIZE = {
         startEvent:               { w: 36,  h: 36 },
         endEvent:                 { w: 36,  h: 36 },
@@ -236,87 +244,69 @@ function generateDI(structure, processId) {
     };
     const sz = type => NODE_SIZE[type] || NODE_SIZE.task;
 
-    const POOL_X      = 160;
-    const POOL_Y      = 60;
-    const LABEL_W     = 30;
-    const LANE_X      = POOL_X + LABEL_W;
-    const COL_W       = 250;   // px between column centers
-    const ROW_H       = 160;   // px between row centers — extra space prevents arc crowding
-    const LANE_PAD    = 55;    // top+bottom padding — arcs live in the top padding zone
-    const START_CX    = LANE_X + 80; // center-x of column 0
-    const MAX_PER_ROW = 5;     // max nodes per row — keeps most lanes to a single clean row
-    const HW_MARGIN   = 420;   // extra px right of last node reserved for highway tracks
+    // ── Layout constants ──────────────────────────────────────
+    const POOL_X    = 160;
+    const LABEL_W   = 30;          // pool/lane label strip width
+    const LANE_X    = POOL_X + LABEL_W;
+    const COL_W     = 260;         // horizontal gap between node centres
+    const ROW_H     = 200;         // vertical gap between row centres (within a lane)
+    const V_PAD     = 80;          // top/bottom padding inside each lane row
+    const START_CX  = LANE_X + 90; // centre-x of column 0
+    const MAX_COLS  = 6;           // wrap to new row after this many columns
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // ── 1. PER-LANE topological order ────────────────────────
-    // For each lane: sort its nodes by their topological rank WITHIN the lane.
-    // Nodes with no in-lane predecessors get rank 0.
-    const laneOrder = {}; // role -> [stepId in topo order]
-
+    // ── 1. Topological order within each lane ─────────────────
+    const laneOrder = {};
     roles.forEach(role => {
         const members = new Set(steps.filter(s => s.role === role).map(s => s.id));
-
-        // Count in-lane in-degrees
-        const inDeg = {};
+        const inDeg   = {};
         members.forEach(id => { inDeg[id] = 0; });
         members.forEach(id => {
             (stepMap[id]?.next || []).forEach(nid => {
                 if (members.has(nid)) inDeg[nid]++;
             });
         });
-
-        // BFS in JSON order for stability at equal ranks
-        const queue = steps
-            .filter(s => members.has(s.id) && inDeg[s.id] === 0)
-            .map(s => s.id);
-        if (!queue.length) {
-            // fallback: just use JSON order
-            laneOrder[role] = steps.filter(s => s.role === role).map(s => s.id);
-            return;
-        }
-
-        const order = [];
-        const seen = new Set();
+        const queue = [...members].filter(id => inDeg[id] === 0);
+        if (!queue.length && members.size) queue.push([...members][0]);
+        const order = [], seen = new Set();
         while (queue.length) {
             const id = queue.shift();
             if (seen.has(id)) continue;
-            seen.add(id);
-            order.push(id);
+            seen.add(id); order.push(id);
             (stepMap[id]?.next || []).forEach(nid => {
                 if (members.has(nid) && !seen.has(nid)) queue.push(nid);
             });
         }
-        // append any unreachable nodes (cycles / orphans)
         steps.filter(s => members.has(s.id) && !seen.has(s.id))
              .forEach(s => order.push(s.id));
-
         laneOrder[role] = order;
     });
 
-    // ── 2. Assign (localCol, row) within each lane ───────────
-    // Wrap every MAX_PER_ROW nodes onto a new row.
-    const nodeLocalCol = {}; // id -> col within its lane
-    const nodeRow      = {}; // id -> row within its lane
+    // ── 2. Assign col/row within each lane ────────────────────
+    // Single row when n <= MAX_COLS, wrap when > MAX_COLS.
+    const nodeCol = {}, nodeRow = {};
+    const laneRows = {};   // role → number of rows used
 
     roles.forEach(role => {
-        (laneOrder[role] || []).forEach((id, idx) => {
-            nodeRow[id]      = Math.floor(idx / MAX_PER_ROW);
-            nodeLocalCol[id] = idx % MAX_PER_ROW;
+        const order = laneOrder[role] || [];
+        let rowCount = 0;
+        order.forEach((id, idx) => {
+            nodeCol[id] = idx % MAX_COLS;
+            nodeRow[id] = Math.floor(idx / MAX_COLS);
+            rowCount = Math.max(rowCount, nodeRow[id] + 1);
         });
+        laneRows[role] = Math.max(rowCount, 1);
     });
 
     // ── 3. Lane heights ───────────────────────────────────────
-    const laneRowCount = {}; // ri -> number of rows
-    roles.forEach((role, ri) => {
-        const ids = laneOrder[role] || [];
-        laneRowCount[ri] = ids.length ? Math.ceil(ids.length / MAX_PER_ROW) : 1;
-    });
-
     const laneH = {};
-    roles.forEach((_, ri) => {
-        laneH[ri] = LANE_PAD + laneRowCount[ri] * ROW_H + LANE_PAD;
+    roles.forEach((role, ri) => {
+        const rows = laneRows[role];
+        // Each row needs V_PAD above + ROW_H + V_PAD below.
+        // For multi-row: share the middle padding between rows.
+        laneH[ri] = V_PAD + rows * ROW_H + (rows - 1) * 20 + V_PAD;
     });
 
     // ── 4. Lane Y positions ───────────────────────────────────
@@ -330,139 +320,102 @@ function generateDI(structure, processId) {
     steps.forEach(s => {
         const { w, h } = sz(s.type);
         const ri  = roles.indexOf(s.role);
-        const col = nodeLocalCol[s.id] ?? 0;
-        const row = nodeRow[s.id]      ?? 0;
+        const col = nodeCol[s.id] ?? 0;
+        const row = nodeRow[s.id] ?? 0;
         const cx  = START_CX + col * COL_W;
-        const cy  = laneY[ri] + LANE_PAD + row * ROW_H + ROW_H / 2;
+        const rowOffset = row * (ROW_H + 20);
+        const cy  = laneY[ri] + V_PAD + ROW_H / 2 + rowOffset;
         pos[s.id] = { x: cx - w / 2, y: cy - h / 2, w, h, cx, cy };
     });
 
-    // Pool width = widest lane content + right margin
-    const maxContentX = Math.max(...steps.map(s => {
-        const p = pos[s.id]; return p ? p.x + p.w : 0;
-    }));
+    // Pool width: cover all nodes + highway margin
+    const maxContentX = steps.reduce((m, s) => {
+        const p = pos[s.id]; return p ? Math.max(m, p.x + p.w) : m;
+    }, 0);
 
-    // ── Hybrid cross-lane routing system ────────────────────────
+    // ── 6. Cross-lane highway routing ─────────────────────────
     //
-    // DOWN connections (source lane above target):
-    //   Exit source BOTTOM → drop to src bottom-padding zone →
-    //   travel RIGHT to a dedicated highway track →
-    //   drop vertically to tgt top-padding zone →
-    //   slide LEFT to tgtCX → enter target TOP
+    // DOWN (src lane above tgt): exit node bottom → drop to bottom-pad slot →
+    //   slide right to dedicated highway track → drop to tgt top-pad slot →
+    //   enter target top.
     //
-    //   Tracks are staggered: closest-gap = innermost track (near content),
-    //   furthest-gap = outermost track (further right). Each connection gets
-    //   its own track, clearly visible and separated.
+    // UP (src lane below tgt): exit node top → rise to top-pad slot →
+    //   slide right to highway track → rise to tgt bottom-pad slot →
+    //   enter target bottom.
     //
-    // UP connections (source lane below target):
-    //   Exit source TOP → rise to src top-padding zone →
-    //   travel LEFT to a dedicated left corridor track →
-    //   rise vertically to tgt bottom-padding zone →
-    //   slide RIGHT to tgtCX → enter target BOTTOM
-    //
-    //   Left corridor tracks fan leftward from LANE_X - 5.
-    //   UP connections are typically few (module → menu returns),
-    //   so the narrow left margin accommodates them.
-    //
-    // This gives a clean visual separation:
-    //   Right side  = outgoing fan from hubs (clearly spread out)
-    //   Left side   = return connections (compact, minimal)
-    //   No horizontal segments at node level in any lane.
+    // Highway tracks fan RIGHT from maxContentX, one track per connection,
+    // staggered 20 px apart (outermost = longest gap).
+    // paddingY for each connection is staggered 24 px per source-rank
+    // so condition labels never overlap (label height = 20 px).
 
-    const HW_BASE    = maxContentX + 40;   // first highway track X (right of all content)
-    const HW_STAGGER = 20;                  // px between highway tracks (compact, still distinct)
+    const HW_BASE    = maxContentX + 50;
+    const HW_STEP    = 22;   // px between highway tracks
+    const PAD_STEP   = 24;   // px between paddingY slots (must be > label height 20)
+    const HW_MARGIN  = 500;
 
-    // ── Assign global highway tracks for ALL cross-lane connections ───────
-    //
-    // Both DOWN and UP connections use the RIGHT-SIDE highway.
-    // This keeps ALL cross-lane lines in the visible right margin — no lines
-    // hidden under the pool label.
-    //
-    // Track assignment:
-    //   - All connections sorted by (srcLane, gap_size)
-    //   - Each gets a globally unique track X = HW_BASE + globalRank * HW_STAGGER
-    //   - DOWN connections: closest lane gap → innermost track (smallest X)
-    //   - UP connections: interleaved after DOWN tracks of same source lane
-    //   - This ensures connections from the same hub visually fan out right
-    //     and return connections (UP) also clearly visible and separated.
+    const poolW = Math.max(HW_BASE + 20 * HW_STEP + 80, maxContentX + HW_MARGIN) - POOL_X;
 
-    const hwXMap     = new Map();  // "srcId->tgtId" → highway track X
-    const downRankMap = new Map(); // "srcId->tgtId" → rank within source (for paddingY)
-    const upRankMap   = new Map(); // "srcId->tgtId" → rank within source (for paddingY)
-    let   globalHWRank = 0;
+    // Collect and sort cross-lane edges
+    const hwMap      = new Map();  // "src→tgt" → hwX
+    const downRank   = new Map();  // "src→tgt" → per-source down rank
+    const upRank     = new Map();  // "src→tgt" → per-source up rank
+    let   hwGlobal   = 0;
 
     {
-        // Collect ALL cross-lane connections (down and up)
-        const allCross = [];
-        steps.forEach(step => {
-            const srcRi = roles.indexOf(step.role);
-            (step.next || []).forEach(targetId => {
-                const tgt = stepMap[targetId];
-                if (!tgt) return;
-                const tgtRi = roles.indexOf(tgt.role);
-                if (tgtRi === srcRi) return;
-                const gap  = Math.abs(tgtRi - srcRi);
-                const dir  = tgtRi > srcRi ? 'down' : 'up';
-                const col  = nodeLocalCol[step.id] ?? 0;
-                allCross.push({ srcId: step.id, tgtId: targetId, srcRi, tgtRi, gap, dir, col });
+        const cross = [];
+        steps.forEach(s => {
+            const si = roles.indexOf(s.role);
+            (s.next || []).forEach(tid => {
+                const t = stepMap[tid];
+                if (!t) return;
+                const ti = roles.indexOf(t.role);
+                if (ti === si) return;
+                cross.push({ src: s.id, tgt: tid, si, ti,
+                             gap: Math.abs(ti - si),
+                             dir: ti > si ? 'down' : 'up',
+                             col: nodeCol[s.id] ?? 0 });
             });
         });
-
-        // Sort: by srcLane → then DOWN before UP → then by gap (closest first)
-        allCross.sort((a, b) =>
-            a.srcRi - b.srcRi ||
+        cross.sort((a, b) =>
+            a.si - b.si ||
             (a.dir === 'down' ? 0 : 1) - (b.dir === 'down' ? 0 : 1) ||
             a.gap - b.gap ||
             a.col - b.col
         );
 
-        // Assign per-source rank counters (for paddingY staggering)
-        const srcDownCounter = new Map();
-        const srcUpCounter   = new Map();
-
-        allCross.forEach(e => {
-            const key = `${e.srcId}->${e.tgtId}`;
-
-            // Assign highway track
-            hwXMap.set(key, HW_BASE + globalHWRank * HW_STAGGER);
-            globalHWRank++;
-
-            // Assign per-source rank for paddingY staggering
+        const dCnt = new Map(), uCnt = new Map();
+        cross.forEach(e => {
+            const key = `${e.src}->${e.tgt}`;
+            hwMap.set(key, HW_BASE + hwGlobal * HW_STEP);
+            hwGlobal++;
             if (e.dir === 'down') {
-                const cnt = srcDownCounter.get(e.srcId) || 0;
-                downRankMap.set(key, cnt);
-                srcDownCounter.set(e.srcId, cnt + 1);
+                const c = dCnt.get(e.src) || 0;
+                downRank.set(key, c); dCnt.set(e.src, c + 1);
             } else {
-                const cnt = srcUpCounter.get(e.srcId) || 0;
-                upRankMap.set(key, cnt);
-                srcUpCounter.set(e.srcId, cnt + 1);
+                const c = uCnt.get(e.src) || 0;
+                upRank.set(key, c); uCnt.set(e.src, c + 1);
             }
         });
     }
 
-    // Pool width: accommodate the rightmost highway track
-    const totalTracks = globalHWRank;
-    const requiredW   = HW_BASE + totalTracks * HW_STAGGER + 60;
-    const poolW       = Math.max(requiredW, maxContentX + HW_MARGIN) - POOL_X;
-
     // ── Helpers ───────────────────────────────────────────────
     const P   = id => pos[id];
-    const R   = id => P(id).x + P(id).w;   // right edge x
-    const L   = id => P(id).x;             // left edge x
-    const T   = id => P(id).y;             // top edge y
-    const B   = id => P(id).y + P(id).h;   // bottom edge y
+    const R   = id => P(id).x + P(id).w;
+    const L   = id => P(id).x;
+    const T   = id => P(id).y;
+    const B   = id => P(id).y + P(id).h;
     const CX  = id => P(id).cx;
     const CY  = id => P(id).cy;
     const wpt = pts => pts.map(([x, y]) =>
         `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`).join('\n');
 
-    // ── 6. Shapes XML ─────────────────────────────────────────
-    let shapes = `      <bpmndi:BPMNShape id="Participant_1_di" bpmnElement="Participant_1" isHorizontal="true">
+    // ── 7. Build shapes XML ───────────────────────────────────
+    let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
 
     roles.forEach((_, i) => {
-        shapes += `      <bpmndi:BPMNShape id="Lane_${i}_di" bpmnElement="Lane_${i}" isHorizontal="true">
+        shapes += `      <bpmndi:BPMNShape id="Lane_${LANE_PFX}${i}_di" bpmnElement="Lane_${LANE_PFX}${i}" isHorizontal="true">
         <dc:Bounds x="${LANE_X}" y="${laneY[i]}" width="${poolW - LABEL_W}" height="${laneH[i]}"/>
       </bpmndi:BPMNShape>\n`;
     });
@@ -475,7 +428,7 @@ function generateDI(structure, processId) {
       </bpmndi:BPMNShape>\n`;
     });
 
-    // ── 7. Edges XML ──────────────────────────────────────────
+    // ── 8. Build edges XML ────────────────────────────────────
     let edges = '';
 
     steps.forEach(step => {
@@ -497,148 +450,96 @@ function generateDI(structure, processId) {
 
             if (srcRi === tgtRi) {
                 // ── Same lane ─────────────────────────────────
-                //
-                // The lane's top-padding zone (LANE_PAD px above the first row)
-                // is reserved for backward arcs and wrap connectors.
-                // Each arc gets a dedicated vertical slot within that zone
-                // so arcs from different pairs never share the same Y line.
-                //
-                // Arc slots are spaced 12px apart starting from the top:
-                //   slot 0 → laneY + 10
-                //   slot 1 → laneY + 22
-                //   slot 2 → laneY + 34
-                //   ...
-                // We use (srcCol + tgtCol) mod (available slots) to pick a slot,
-                // giving each pair a consistent, spread-out arc height.
+                const lTop  = laneY[srcRi];
+                const lPad  = V_PAD;
 
-                const laneTop = laneY[srcRi];
-                const ARC_SLOT_H = 12;  // px between arc slots
-                const ARC_SLOTS  = Math.floor((LANE_PAD - 10) / ARC_SLOT_H); // how many slots fit
-                const srcCol     = nodeLocalCol[step.id]   ?? 0;
-                const tgtCol     = nodeLocalCol[targetId]  ?? 0;
-
-                if (srcRow === tgtRow && x2 > x1) {
-                    // ── Forward, same row → straight horizontal ──────────
-                    pts = [[x1, y1], [x2, y2]];
-
-                } else if (srcRow < tgtRow && nodeLocalCol[targetId] === 0) {
-                    // ── Row wrap (forward, source last col → next row col 0) ─
-                    // Exit right → travel down the right margin → re-enter left.
-                    // The right margin is between the last column and the pool edge.
-                    // This keeps the path clear of all node content.
-                    const wrapX  = START_CX + (MAX_PER_ROW - 1) * COL_W + 80;  // right of last node
-                    const midY   = laneY[srcRi] + LANE_PAD + (srcRow + 1) * ROW_H; // between the two rows
+                if (srcRow < tgtRow) {
+                    // Forward wrap: right edge → down → re-enter col 0
+                    const wrapX = START_CX + (MAX_COLS - 1) * COL_W + 80;
+                    const midY  = laneY[srcRi] + V_PAD + (srcRow + 1) * (ROW_H + 20);
                     pts = [
-                        [x1,           y1],
-                        [wrapX,        y1],
-                        [wrapX,        midY],
-                        [START_CX - 50, midY],
-                        [START_CX - 50, y2],
-                        [x2,           y2],
+                        [x1, y1], [wrapX, y1], [wrapX, midY],
+                        [START_CX - 50, midY], [START_CX - 50, y2], [x2, y2],
                     ];
-
                 } else if (srcRow === tgtRow && x2 < x1) {
-                    // ── Backward loop within same row ────────────────────
-                    // Arc goes ABOVE the lane, into the top-padding zone.
-                    // Slot is chosen by (srcCol % ARC_SLOTS) to spread arcs out.
-                    const slot   = srcCol % Math.max(1, ARC_SLOTS);
-                    const arcY   = laneTop + 10 + slot * ARC_SLOT_H;
+                    // Backward arc: above lane in top padding
+                    const arcY = lTop + 12;
                     pts = [
-                        [x1,      y1],
-                        [x1 + 12, y1],
-                        [x1 + 12, arcY],
-                        [x2 - 12, arcY],
-                        [x2 - 12, y2],
-                        [x2,      y2],
+                        [x1, y1], [x1 + 12, y1], [x1 + 12, arcY],
+                        [x2 - 12, arcY], [x2 - 12, y2], [x2, y2],
                     ];
-
-                } else if (srcRow > tgtRow) {
-                    // ── Cross-row backward (e.g. row2 → row1) ───────────
-                    // Route via the BOTTOM padding zone to avoid the wrap path.
-                    // Exit right → go to right margin → rise to target row → enter left.
-                    const wrapX = START_CX + (MAX_PER_ROW - 1) * COL_W + 80;
-                    pts = [
-                        [x1,           y1],
-                        [wrapX,        y1],
-                        [wrapX,        y2],
-                        [x2,           y2],
-                    ];
-
                 } else {
-                    // ── Forward, different row, non-zero target col ──────
-                    const midX = Math.round((x1 + x2) / 2);
-                    pts = [[x1, y1], [midX, y1], [midX, y2], [x2, y2]];
+                    // Simple forward, same row
+                    pts = [[x1, y1], [x2, y2]];
                 }
-            } else {
-                // ── Cross-lane — Unified RIGHT-HIGHWAY routing ──────────────
-                //
-                // ALL cross-lane connections (DOWN and UP) travel through the
-                // RIGHT-SIDE highway zone. Each gets its own unique track X,
-                // so all lines are clearly visible and separated — no bundling.
-                //
-                // DOWN path (source above target):
-                //   Exit source BOTTOM → drop into src bottom-padding slot →
-                //   slide RIGHT to dedicated highway track X →
-                //   drop to tgt top-padding → slide LEFT to tgtCX → enter TOP.
-                //
-                // UP path (source below target):
-                //   Exit source TOP → rise into src top-padding slot →
-                //   slide RIGHT to dedicated highway track X →
-                //   rise to tgt bottom-padding → slide LEFT to tgtCX → enter BOTTOM.
-                //
-                // paddingY slots are staggered 12px per rank so multiple connections
-                // from the same source node don't overlap near the source.
 
-                const srcCX     = CX(step.id);
-                const tgtCX     = CX(targetId);
-                const srcBottom = B(step.id);
-                const srcTop    = T(step.id);
-                const tgtBottom = B(targetId);
-                const tgtTop    = T(targetId);
-                const hwX       = hwXMap.get(`${step.id}->${targetId}`) ?? HW_BASE;
+            } else {
+                // ── Cross-lane highway ────────────────────────
+                const key  = `${step.id}->${targetId}`;
+                const hwX  = hwMap.get(key) ?? HW_BASE;
 
                 if (srcRi < tgtRi) {
-                    // ── Going DOWN ────────────────────────────────────────
-                    const rank     = downRankMap.get(`${step.id}->${targetId}`) ?? 0;
-                    const padBase  = laneY[srcRi] + laneH[srcRi] - Math.round(LANE_PAD / 2);
-                    const paddingY = padBase - rank * 12;
-                    const tgtPadY  = laneY[tgtRi] + Math.round(LANE_PAD / 2);
-
+                    // Going DOWN
+                    const rank    = downRank.get(key) ?? 0;
+                    const padBase = laneY[srcRi] + laneH[srcRi] - Math.round(V_PAD / 2);
+                    const padY    = padBase - rank * PAD_STEP;
+                    const tPadY   = laneY[tgtRi] + Math.round(V_PAD / 2);
                     pts = [
-                        [srcCX,  srcBottom],  // exit source bottom
-                        [srcCX,  paddingY],   // drop into src bottom-padding slot
-                        [hwX,    paddingY],   // slide right to highway
-                        [hwX,    tgtPadY],    // drop to tgt top-padding
-                        [tgtCX,  tgtTop],     // slide left, enter target top
+                        [CX(step.id), B(step.id)],
+                        [CX(step.id), padY],
+                        [hwX,         padY],
+                        [hwX,         tPadY],
+                        [CX(targetId),T(targetId)],
                     ];
                 } else {
-                    // ── Going UP ─────────────────────────────────────────
-                    const rank     = upRankMap.get(`${step.id}->${targetId}`) ?? 0;
-                    const padBase  = laneY[srcRi] + Math.round(LANE_PAD / 2);
-                    const paddingY = padBase + rank * 12;
-                    const tgtPadY  = laneY[tgtRi] + laneH[tgtRi] - Math.round(LANE_PAD / 2);
-
+                    // Going UP
+                    const rank    = upRank.get(key) ?? 0;
+                    const padBase = laneY[srcRi] + Math.round(V_PAD / 2);
+                    const padY    = padBase + rank * PAD_STEP;
+                    const tPadY   = laneY[tgtRi] + laneH[tgtRi] - Math.round(V_PAD / 2);
                     pts = [
-                        [srcCX,  srcTop],     // exit source top
-                        [srcCX,  paddingY],   // rise into src top-padding slot
-                        [hwX,    paddingY],   // slide right to highway
-                        [hwX,    tgtPadY],    // rise to tgt bottom-padding
-                        [tgtCX,  tgtBottom],  // slide left, enter target bottom
+                        [CX(step.id), T(step.id)],
+                        [CX(step.id), padY],
+                        [hwX,         padY],
+                        [hwX,         tPadY],
+                        [CX(targetId),B(targetId)],
                     ];
                 }
             }
 
-            edges += `      <bpmndi:BPMNEdge id="${edgeId}" bpmnElement="${flowId}">
+            // ── Condition label positioning ───────────────────
+            // Anchored at (hwX - labelW - 8, padY + 3) for cross-lane flows:
+            //   hwX is unique per track → horizontal spread
+            //   padY is staggered 24 px → vertical spread (> labelH 20 px)
+            //   ⟹ No two labels ever share the same position.
+            const condText = step.conditions?.[targetId];
+            let labelXml = '';
+            if (condText) {
+                const labelW = Math.min(condText.length * 7 + 10, 130);
+                let lx, ly;
+                if (pts.length >= 5) {
+                    // Use highway elbow position
+                    lx = Math.round(pts[2][0] - labelW - 8);
+                    ly = Math.round(pts[1][1] + 3);
+                } else if (pts.length >= 3) {
+                    lx = Math.round((pts[1][0] + pts[2][0]) / 2 - labelW / 2);
+                    ly = Math.round(pts[1][1] + 3);
+                } else {
+                    lx = Math.round((pts[0][0] + pts[pts.length-1][0]) / 2 - labelW / 2);
+                    ly = Math.round((pts[0][1] + pts[pts.length-1][1]) / 2 - 10);
+                }
+                labelXml = `\n        <bpmndi:BPMNLabel><dc:Bounds x="${lx}" y="${ly}" width="${labelW}" height="20"/></bpmndi:BPMNLabel>`;
+            }
+
+            edges += `      <bpmndi:BPMNEdge id="${edgeId}" bpmnElement="${flowId}">${labelXml}
 ${wpt(pts)}
       </bpmndi:BPMNEdge>\n`;
         });
     });
 
-    return `  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
-    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collaboration_1">
-${shapes}${edges}    </bpmndi:BPMNPlane>
-  </bpmndi:BPMNDiagram>`;
+    return { poolH, shapesXml: shapes, edgesXml: edges };
 }
+
 
 // ============================================================
 // 5. PROMPT — pide JSON compacto, máx 50 pasos
@@ -690,7 +591,7 @@ REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
 Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
 
   1. Inicio de sesión         ← startEvent va aquí
-  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 8 nodos
+  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 6 nodos
   3. Recuperación contraseña  ← si el manual lo describe
   4. Verificación de cuenta   ← si el manual lo describe
   5. Menú principal           ← siempre presente
@@ -718,7 +619,7 @@ REGLA 5 — REGLAS TÉCNICAS
 • IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
 • NUNCA referencias circulares directas: A → B → A
 • "conditions" obligatorio en exclusiveGateway con más de una salida.
-• Máximo 8 nodos por lane. Si hay más → dividir: "Sección - Parte 1", "Sección - Parte 2"
+• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2". Nunca más de 5 nodos en un mismo lane. Esta regla es ABSOLUTA.
 • steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
 
 TIPOS DE NODO:
@@ -939,24 +840,78 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             }
         });
 
-        const processId = `Process_${Date.now()}`;
+        // ── Split roles into two pools: Ciudadano and Brigadista ──────────────
+        // Detect the split point: first lane with "brigadista" that follows
+        // one or more "ciudadano" lanes. Each pool gets its own process and DI.
+        const allRoles  = structure.roles;
+        const allSteps  = structure.steps;
+        const splitIdx  = (() => {
+            for (let i = 1; i < allRoles.length; i++) {
+                const hasBrig = allRoles[i].toLowerCase().includes('brigadista');
+                const prevCiu = allRoles[i-1].toLowerCase().includes('ciudadano') ||
+                                !allRoles[i-1].toLowerCase().includes('brigadista');
+                if (hasBrig && prevCiu) return i;
+            }
+            return -1;  // no split found → single pool
+        })();
 
+        const processId  = `Process_${Date.now()}`;
+        const processId2 = `Process_${Date.now() + 1}`;
+
+        let logicXml, diXml, collaborationXml, finalXml;
         console.log('⚙️  Generando XML...');
-        let logicXml, diXml;
-        try {
-            logicXml = generateLogic(structure, processId);
-            console.log('✓ generateLogic OK');
-        } catch (e) {
-            throw new Error(`Error en generateLogic: ${e.message}`);
-        }
-        try {
-            diXml = generateDI(structure, processId);
-            console.log('✓ generateDI OK');
-        } catch (e) {
-            throw new Error(`Error en generateDI: ${e.message}`);
+
+        if (splitIdx > 0) {
+            // Two-pool mode — UN solo archivo, dos pools apilados verticalmente.
+            // Pool 1 (Ciudadano) arriba en y=60.
+            // Pool 2 (Brigadista) debajo del Pool 1 con 60px de separación.
+            // Ambos dentro de UNA collaboration y UN BPMNDiagram → un solo canvas limpio.
+            const roles1  = allRoles.slice(0, splitIdx);
+            const roles2  = allRoles.slice(splitIdx);
+            const steps1  = allSteps.filter(s => roles1.includes(s.role));
+            const steps2  = allSteps.filter(s => roles2.includes(s.role));
+            const struct1 = { roles: roles1, steps: steps1 };
+            const struct2 = { roles: roles2, steps: steps2 };
+
+            const cleanPoolName1 = roles1.some(r => r.toLowerCase().includes('ciudadano'))   ? 'Portal Ciudadano'        : 'Proceso Ciudadano';
+            const cleanPoolName2 = roles2.some(r => r.toLowerCase().includes('brigadista'))  ? 'Herramienta Brigadista'  : 'Proceso Brigadista';
+
+            try {
+                logicXml = generateLogic(struct1, processId, '') + '\n' + generateLogic(struct2, processId2, 'B');
+            } catch (e) { throw new Error(`Error en generateLogic: ${e.message}`); }
+
+            let di1, di2;
+            try {
+                di1 = generateDI(struct1, processId,  { poolY: 60,                  poolId: 'Participant_1', poolName: cleanPoolName1 });
+                di2 = generateDI(struct2, processId2, { poolY: 60 + di1.poolH + 60, poolId: 'Participant_2', poolName: cleanPoolName2 });
+                // Un solo BPMNDiagram con ambos pools apilados — uno arriba, otro abajo
+                diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
+    <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
+${di1.shapesXml}${di2.shapesXml}${di1.edgesXml}${di2.edgesXml}    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>`;
+            } catch (e) { throw new Error(`Error en generateDI: ${e.message}`); }
+
+            collaborationXml = `  <collaboration id="Collaboration_1">
+    <participant id="Participant_1" name="${xmlEscape(cleanPoolName1)}" processRef="${processId}"/>
+    <participant id="Participant_2" name="${xmlEscape(cleanPoolName2)}" processRef="${processId2}"/>
+  </collaboration>`;
+        } else {
+            // Single pool fallback
+            try { logicXml = generateLogic(structure, processId); }
+            catch (e) { throw new Error(`Error en generateLogic: ${e.message}`); }
+            try {
+                const di = generateDI(structure, processId, { poolY: 60, poolId: 'Participant_1', poolName: 'Proceso de Negocio' });
+                diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
+    <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
+${di.shapesXml}${di.edgesXml}    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>`;
+            } catch (e) { throw new Error(`Error en generateDI: ${e.message}`); }
+            collaborationXml = `  <collaboration id="Collaboration_1">
+    <participant id="Participant_1" name="Proceso de Negocio" processRef="${processId}"/>
+  </collaboration>`;
         }
 
-        const finalXml = `<?xml version="1.0" encoding="utf-8"?>
+        finalXml = `<?xml version="1.0" encoding="utf-8"?>
 <definitions
   xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -968,9 +923,7 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
   targetNamespace="http://www.bizagi.com/definitions/20250226143500"
   exporter="Bizagi Modeler"
   exporterVersion="3.4.0.013">
-  <collaboration id="Collaboration_1">
-    <participant id="Participant_1" name="Proceso de Negocio" processRef="${processId}"/>
-  </collaboration>
+${collaborationXml}
 ${logicXml}
 ${diXml}
 </definitions>`;
