@@ -5,6 +5,12 @@ const pdf     = require('pdf-parse');
 const cors    = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// OpenClaw y detección de procesos (opcionales — si no existen, se omiten sin error)
+let analyzeManual = null;
+let detectBusinessProcesses = null;
+try { ({ analyzeManual } = require('./openclaw/client')); } catch(_) {}
+try { ({ detectBusinessProcesses } = require('./services/processDetection')); } catch(_) {}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '150mb' }));
@@ -545,292 +551,89 @@ ${wpt(pts)}
 // 5. PROMPT — pide JSON compacto, máx 50 pasos
 // ============================================================
 function buildPrompt(text) {
-    return `ROL DEL MODELO
-
-Actúa como arquitecto senior de procesos especializado en BPMN 2.0, arquitectura de sistemas y análisis funcional de plataformas digitales.
-
-Tu tarea es analizar manuales de usuario, documentación funcional o descripciones operativas de sistemas y convertirlos en modelos BPMN claros, consistentes y técnicamente correctos.
-
-El objetivo es generar modelos que permitan comprender:
-
-• cómo funciona la plataforma
-• qué actores participan
-• qué sistemas intervienen
-• cómo se conectan los procesos
-
-Los diagramas deben ser comprensibles para analistas de procesos, arquitectos de sistemas y equipos técnicos.
-
-Evita diagramas confusos, actividades ambiguas o flujos cruzados.
-
-------------------------------------------------------------
-
-OBJETIVO DEL ANÁLISIS
-
-A partir del documento debes identificar:
-
-• procesos del sistema
-• módulos funcionales
-• roles de usuario
-• sistemas involucrados
-• integraciones entre sistemas
-• APIs o servicios
-• etapas del proceso
-
-Después debes generar un modelo BPMN estructurado.
-
-------------------------------------------------------------
-
-FASE 0 — ANÁLISIS ARQUITECTÓNICO DE LA PLATAFORMA
-
-Antes de generar cualquier proceso debes analizar la estructura del sistema.
-
-0.1 MÓDULOS DEL SISTEMA
-
-Identifica los módulos funcionales principales.
-
-Ejemplo:
-
-Registro de usuarios
-Gestión de citas
-Credencialización
-Administración
-Activación de servicios
-Soporte
-Reportes
-
-Cada módulo agrupa procesos relacionados.
-
-------------------------------------------------------------
-
-0.2 ROLES DEL SISTEMA
-
-Identifica los roles que interactúan con la plataforma.
-
-Ejemplo:
-
-Usuario
-Operador
-Administrador
-Call Center
-Sistema automático
-Sistema externo
-
-Los roles representan quién ejecuta cada actividad.
-
-------------------------------------------------------------
-
-0.3 PROCESOS POR MÓDULO
-
-Dentro de cada módulo identifica los procesos que lo componen.
-
-Ejemplo:
-
-Módulo: Gestión de citas
-
-Consultar disponibilidad
-Asignar cita
-Confirmar cita
-Modificar cita
-Cancelar cita
-
-------------------------------------------------------------
-
-0.4 SISTEMAS INVOLUCRADOS
-
-Identifica los sistemas o plataformas que participan en el flujo.
-
-Ejemplo:
-
-Sistema de Registro
-Sistema de Citas
-Sistema de Credencialización
-Sistema Financiero
-Sistema de Soporte
-Sistema de Notificaciones
-
-------------------------------------------------------------
-
-0.5 INTEGRACIONES ENTRE SISTEMAS
-
-Detecta cuando un sistema consulta o envía información a otro.
-
-Ejemplo:
-
-API validación de usuario
-API consulta de citas
-API activación de credencial
-API confirmación de entrega
-
-Estas integraciones se representarán como Service Tasks.
-
-------------------------------------------------------------
-
-FASE 1 — IDENTIFICACIÓN DEL PROCESO PRINCIPAL
-
-Define el proceso principal descrito en el manual.
-
-Ejemplo:
-
-Proceso de credencialización
-Proceso de registro de usuario
-Proceso de activación de servicio
-Proceso de gestión de citas
-
-------------------------------------------------------------
-
-FASE 2 — IDENTIFICACIÓN DE SUBPROCESOS
-
-Si el manual describe varias etapas o módulos dentro del proceso principal, conviértelos en subprocesos.
-
-Ejemplo:
-
-Proceso: Credencialización
-
-Subprocesos:
-
-Pre-registro
-Validación de información
-Gestión de citas
-Entrega de credencial
-Activación
-Soporte y reposición
-
-REGLA
-
-Si un módulo contiene más de 7 actividades, modelarlo como subproceso.
-
-Si contiene menos actividades, usar tareas normales.
-
-------------------------------------------------------------
-
-FASE 3 — DEFINICIÓN DE ETAPAS DEL PROCESO
-
-Divide el proceso en etapas funcionales.
-
-Las etapas se representarán como lanes.
-
-Ejemplo:
-
-Pre-registro
-Validación
-Gestión de citas
-Entrega
-Activación
-Soporte
-
-Cada etapa debe contener preferentemente entre 3 y 7 actividades.
-
-------------------------------------------------------------
-
-FASE 4 — MODELO HÍBRIDO DE RESPONSABILIDADES
-
-El BPMN debe organizarse de la siguiente forma:
-
-LANES
-
-Representan etapas del proceso.
-
-RESPONSABLE
-
-Cada tarea debe indicar el rol responsable.
-
-Ejemplo:
-
-Registrar solicitud
-Responsable: Usuario
-
-SISTEMA
-
-Cada tarea puede indicar el sistema que ejecuta la acción.
-
-Ejemplo:
-
-Validar datos
-Sistema: Sistema de Registro
-
-------------------------------------------------------------
-
-FASE 5 — ELEMENTOS BPMN
-
-Usar correctamente:
-
-Start Event
-End Event
-User Task
-System Task
-Service Task
-Exclusive Gateway (XOR)
-
-Ejemplos:
-
-User Task
-Registrar solicitud
-
-System Task
-Validar información
-
-Service Task
-Consultar API de usuarios
-
-Gateway
-¿Datos válidos?
-
-Cada gateway debe tener condiciones claras.
-
-------------------------------------------------------------
-
-FASE 6 — REGLAS DE DISEÑO DEL DIAGRAMA
-
-El flujo debe avanzar de izquierda a derecha.
-
-Evitar cruces de líneas.
-
-Cada tarea debe representar una acción del proceso.
-
-No describir acciones de interfaz como:
-
-hacer clic
-presionar botón
-seleccionar menú
-
-Usar acciones del proceso:
-
-Registrar solicitud
-Validar información
-Confirmar registro
-
-------------------------------------------------------------
-
-FASE 7 — REPRESENTACIÓN DE APIs
-
-Las integraciones deben representarse como Service Tasks.
-
-Ejemplo:
-
-API Consulta de Usuario
-API Consulta de Citas
-API Activación de Credencial
-API Confirmación de Entrega
-
-------------------------------------------------------------
-
-REGLA CRÍTICA
-
-No inventar procesos que el documento no describa.
-
-Sin embargo, puedes inferir validaciones o decisiones cuando el flujo lo implique para mantener coherencia del proceso.
-
-------------------------------------------------------------
-
-REGLAS TÉCNICAS OBLIGATORIAS PARA EL JSON
-
+    return `Eres un analista de procesos BPMN experto. Analiza el manual y genera un diagrama BPMN en estilo Bizagi.
+
+TU TAREA: leer el manual COMPLETO y modelar TODOS los procesos descritos, sin omitir ninguna sección.
+
+═══════════════════════════════════════════════════════════
+PASO 1 — ANTES DE GENERAR EL JSON: IDENTIFICA EXHAUSTIVAMENTE
+═══════════════════════════════════════════════════════════
+Lee el manual de principio a fin y lista:
+  A) Todos los tipos de usuario (ej: Ciudadano, Brigadista)
+  B) Para CADA usuario: TODAS las secciones/módulos descritos
+  C) Cada sección → su lane en el diagrama
+
+REGLA DE ORO: si el manual describe una sección, DEBE aparecer como lane.
+No omitas ninguna. Si no estás seguro, inclúyela.
+
+═══════════════════════════════════════════════════════════
+REGLA 1 — LENGUAJE TÉCNICO OBLIGATORIO
+═══════════════════════════════════════════════════════════
+Nombres de tareas: QUÉ hace el actor, nunca CÓMO hace clic en la interfaz.
+  ❌ "Presionar 'Continuar'"       → ✅ "Confirmar datos del formulario"
+  ❌ "Dar clic en 'Cerrar sesión'" → ✅ "Cerrar sesión"
+  ❌ "Presionar ícono editar"      → ✅ "Seleccionar registro para editar"
+  ❌ Tocar / Pulsar / Presionar    → ✅ Ingresar / Validar / Seleccionar / Confirmar
+
+═══════════════════════════════════════════════════════════
+REGLA 2 — ESTRUCTURA DE FLUJO (LEY FUNDAMENTAL)
+═══════════════════════════════════════════════════════════
 • endEvent / endEventMessage NUNCA tiene "next" con valores. Siempre "next": []
 • intermediateEvent SIEMPRE tiene exactamente 1 entrada y 1 salida.
+• PROHIBIDO conectar nodos de un usuario (Ciudadano) con nodos de otro (Brigadista).
+  Cada tipo de usuario es un flujo completamente independiente. No hay conexiones entre ellos.
+• PROHIBIDO que un endEvent apunte a cualquier otro nodo — ni intermediateEvent ni task.
+
+Conectar secciones:
+  ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
+  ❌ última_tarea → endEvent → intermediateEvent  (endEvent termina todo, no puede conectar)
+  ❌ intermediateEvent sin ningún nodo apuntando a él (queda flotante, inválido)
+  ❌ End_SesionCerradaCiudadano → Evt_Brigadista  (cross-pool: ABSOLUTAMENTE PROHIBIDO)
+
+Menú / hub con múltiples módulos:
+  ✅ tarea_visualizar_menu → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
+  Cada Evt_ModX → primera tarea de ese módulo
+  Evt_CerrarSesion → tarea cerrar sesión → endEvent
+
+Módulos con sub-ramas (ej: Gestión de usuarios tiene Crear Y Buscar/Editar):
+  ✅ Evt_GestionUsuarios → "next": ["Task_CrearUsuario", "Task_BuscarUsuario"]
+  Cada rama tiene su propio end event. NO uses intermediateEvents intermedios para esto.
+
+═══════════════════════════════════════════════════════════
+REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
+═══════════════════════════════════════════════════════════
+Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
+
+  1. Inicio de sesión         ← startEvent va aquí
+  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 6 nodos
+  3. Recuperación contraseña  ← si el manual lo describe
+  4. Verificación de cuenta   ← si el manual lo describe
+  5. Menú principal           ← siempre presente
+  6. [Un lane por cada módulo listado en el menú]
+  7. Cerrar sesión            ← siempre el último
+
+Si hay DOS tipos de usuario → DOS bloques de lanes independientes, cada uno con su startEvent.
+NO crear gateway de selección de usuario/portal — son flujos separados.
+
+TODOS los módulos del menú deben tener su propio lane.
+Si el menú lista 6 módulos → 6 lanes de módulos. No resumir en uno solo.
+
+═══════════════════════════════════════════════════════════
+REGLA 4 — NO INVENTAR
+═══════════════════════════════════════════════════════════
+Solo incluye lo que el manual describe explícitamente.
+  ❌ Gateways de selección de rol/tipo de usuario — PROHIBIDO
+  ❌ Lanes o pasos no mencionados en el manual — PROHIBIDO
+  En caso de duda: omite el paso. Diagrama incompleto > diagrama con pasos falsos.
+
+═══════════════════════════════════════════════════════════
+REGLA 5 — REGLAS TÉCNICAS
+═══════════════════════════════════════════════════════════
 • UN startEvent por tipo de usuario, siempre en su lane de inicio.
 • IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
 • NUNCA referencias circulares directas: A → B → A
 • "conditions" obligatorio en exclusiveGateway con más de una salida.
-• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2".
+• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2". Nunca más de 5 nodos en un mismo lane. Esta regla es ABSOLUTA.
 • steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
 
 TIPOS DE NODO:
@@ -844,27 +647,37 @@ TIPOS DE NODO:
   intermediateEvent        → Conector entre secciones / inicio de módulo. 1 entrada, 1 salida.
   intermediateEventMessage → Notificación/mensaje en el flujo (email, código, alerta).
 
-------------------------------------------------------------
-
-FORMATO DE SALIDA OBLIGATORIO
-
+═══════════════════════════════════════════════════════════
+EJEMPLO DE ESTRUCTURA CORRECTA (estructura, no contenido real)
+═══════════════════════════════════════════════════════════
 [MD_START]
-**Módulos identificados:** lista
-**Roles detectados:** lista
-**Sistemas involucrados:** lista
-**Integraciones detectadas:** lista
-**APIs identificadas:** lista
-**Etapas del proceso:** lista
+**Lanes:** lista completa de secciones identificadas
 **Pasos totales:** número
 **Flujo general:** 2-3 líneas
 [MD_END]
 [JSON_START]
 {
-  "roles": ["Etapa 1", "Etapa 2", "..."],
+  "roles": ["Inicio de sesión", "Pre-registro", "Verificación de cuenta", "Menú principal", "Módulo A", "Módulo B", "Cerrar sesión"],
   "steps": [
-    { "id": "Start_Xxx", "name": "Nombre", "type": "startEvent", "role": "Etapa 1", "next": ["Task_Xxx"] },
-    { "id": "Task_Xxx", "name": "Nombre", "type": "userTask", "role": "Etapa 1", "next": ["End_Xxx"] },
-    { "id": "End_Xxx", "name": "Nombre", "type": "endEvent", "role": "Etapa 1", "next": [] }
+    { "id": "Start_Login", "name": "Iniciar proceso", "type": "startEvent", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
+    { "id": "Task_Credenciales", "name": "Ingresar credenciales de acceso", "type": "userTask", "role": "Inicio de sesión", "next": ["Script_ValidarLogin"] },
+    { "id": "Script_ValidarLogin", "name": "Validar credenciales", "type": "scriptTask", "role": "Inicio de sesión", "next": ["GW_Login"] },
+    { "id": "GW_Login", "name": "¿Autenticación exitosa?", "type": "exclusiveGateway", "role": "Inicio de sesión", "next": ["Evt_Menu", "Task_ErrorLogin"], "conditions": {"Evt_Menu": "Sí", "Task_ErrorLogin": "No"} },
+    { "id": "Task_ErrorLogin", "name": "Mostrar error de autenticación", "type": "userTask", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
+    { "id": "Evt_PreRegistro", "name": "Iniciar pre-registro", "type": "intermediateEvent", "role": "Pre-registro", "next": ["Task_LlenarFormulario"] },
+    { "id": "Task_LlenarFormulario", "name": "Completar formulario de registro", "type": "userTask", "role": "Pre-registro", "next": ["End_PreRegistro"] },
+    { "id": "End_PreRegistro", "name": "Pre-registro completado", "type": "endEvent", "role": "Pre-registro", "next": [] },
+    { "id": "Evt_Menu", "name": "Acceso al menú principal", "type": "intermediateEvent", "role": "Menú principal", "next": ["Task_VerMenu"] },
+    { "id": "Task_VerMenu", "name": "Visualizar opciones del menú", "type": "userTask", "role": "Menú principal", "next": ["Evt_ModuloA", "Evt_ModuloB", "Evt_CerrarSesion"] },
+    { "id": "Evt_ModuloA", "name": "Iniciar Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
+    { "id": "Task_AccionA", "name": "Ejecutar acción del módulo A", "type": "userTask", "role": "Módulo A", "next": ["End_ModuloA"] },
+    { "id": "End_ModuloA", "name": "Módulo A completado", "type": "endEventMessage", "role": "Módulo A", "next": [] },
+    { "id": "Evt_ModuloB", "name": "Iniciar Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
+    { "id": "Task_AccionB", "name": "Ejecutar acción del módulo B", "type": "userTask", "role": "Módulo B", "next": ["End_ModuloB"] },
+    { "id": "End_ModuloB", "name": "Módulo B completado", "type": "endEventMessage", "role": "Módulo B", "next": [] },
+    { "id": "Evt_CerrarSesion", "name": "Iniciar cierre de sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_ConfirmarCierre"] },
+    { "id": "Task_ConfirmarCierre", "name": "Confirmar cierre de sesión", "type": "userTask", "role": "Cerrar sesión", "next": ["End_SesionCerrada"] },
+    { "id": "End_SesionCerrada", "name": "Sesión cerrada exitosamente", "type": "endEventMessage", "role": "Cerrar sesión", "next": [] }
   ]
 }
 [JSON_END]
@@ -901,30 +714,105 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             },
         });
 
-        const result       = await model.generateContent(buildPrompt(manualText));
-        const responseText = result.response.text();
-        console.log(`Gemini respondió en ${((Date.now() - t0) / 1000).toFixed(1)}s — ${responseText.length} chars`);
-
-        // ── Extracción robusta: intenta con etiquetas completas primero,
-        //    luego intenta reparar si viene truncado
-        const mdMatch   = responseText.match(/\[MD_START\]([\s\S]*?)\[MD_END\]/);
-        const jsonMatch = responseText.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
-
-        let rawJson = null;
-        if (jsonMatch) {
-            rawJson = jsonMatch[1];
-        } else {
-            const partial = responseText.match(/\[JSON_START\]([\s\S]*)/);
-            if (partial) {
-                console.warn('Respuesta truncada — intentando reparar JSON...');
-                rawJson = partial[1];
+        // ── OpenClaw: análisis estructural previo (opcional) ─────────────
+        let openclawAnalysis = null;
+        if (analyzeManual) {
+            try {
+                console.log('Ejecutando análisis con OpenClaw...');
+                openclawAnalysis = await analyzeManual(manualText);
+                if (openclawAnalysis) console.log('OpenClaw completó el análisis.');
+            } catch(err) {
+                console.log('OpenClaw no disponible, continuando con Gemini.');
             }
         }
 
+        // ── Detectar procesos (multi-diagrama) o usar Gemini directo ─────
+        async function callGemini(promptText) {
+            for (let attempt = 0; attempt < 4; attempt++) {
+                try {
+                    console.log(`Llamando a Gemini (intento ${attempt + 1}/4)...`);
+                    const r = await model.generateContent(promptText);
+                    return r.response.text();
+                } catch(e) {
+                    const msg = e.message || '';
+                    const retry = (msg.includes('503') || msg.includes('429')) && attempt < 3;
+                    if (retry) {
+                        const wait = (attempt + 1) * 20000;
+                        console.warn(`Gemini saturado — esperando ${wait/1000}s...`);
+                        await new Promise(r => setTimeout(r, wait));
+                    } else throw e;
+                }
+            }
+        }
+
+        // Construir texto enriquecido con OpenClaw si está disponible
+        function enrichText(base, processInfo = null) {
+            if (!openclawAnalysis && !processInfo) return base;
+            let enriched = '';
+            if (openclawAnalysis) {
+                enriched += `ANÁLISIS DEL SISTEMA:\n${JSON.stringify(openclawAnalysis, null, 2)}\n\n`;
+            }
+            if (processInfo) {
+                enriched += `PROCESO: ${processInfo.name}\nDESCRIPCIÓN: ${processInfo.description || ''}\nACTORES: ${(processInfo.actors || []).join(', ')}\n\n`;
+            }
+            enriched += `MANUAL:\n${base}`;
+            return enriched;
+        }
+
+        // ── Multi-diagrama si detectBusinessProcesses está disponible ─────
+        let rawJsonList = [];   // [{raw, name}]
+
+        if (detectBusinessProcesses) {
+            const detectedProcesses = await detectBusinessProcesses(manualText);
+            console.log(`Procesos detectados: ${detectedProcesses.length}`);
+
+            for (const process of detectedProcesses) {
+                console.log(`Generando BPMN para: ${process.name}`);
+                try {
+                    const raw = await callGemini(buildPrompt(enrichText(manualText, process)));
+                    rawJsonList.push({ raw, name: process.name });
+                } catch(e) {
+                    console.warn(`Diagrama "${process.name}" falló: ${e.message}`);
+                }
+            }
+        }
+
+        // Fallback: llamada única si no hay detectBusinessProcesses o no detectó nada
+        if (rawJsonList.length === 0) {
+            console.log('Generando diagrama único...');
+            const raw = await callGemini(buildPrompt(enrichText(manualText)));
+            rawJsonList.push({ raw, name: 'Proceso Principal' });
+        }
+
+        // ── Parsear cada respuesta ────────────────────────────────────────
+        function extractJson(responseText) {
+            const mdMatch   = responseText.match(/\[MD_START\]([\s\S]*?)\[MD_END\]/);
+            const jsonMatch = responseText.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
+            let rawJson = null;
+            if (jsonMatch) {
+                rawJson = jsonMatch[1];
+            } else {
+                const partial = responseText.match(/\[JSON_START\]([\s\S]*)/);
+                if (partial) { console.warn('Respuesta truncada — reparando...'); rawJson = partial[1]; }
+            }
+            return { mdMatch, rawJson };
+        }
+
+        const { mdMatch, rawJson: rawJsonFirst } = extractJson(rawJsonList[0].raw);
+        let rawJson = rawJsonFirst;
+
         if (!rawJson) {
-            console.error('Sin JSON en respuesta:', responseText.substring(0, 300));
+            console.error('Sin JSON en respuesta:', rawJsonList[0].raw.substring(0, 300));
             throw new Error('Gemini no devolvió JSON válido. Intenta de nuevo.');
         }
+
+        // Guardar todos los raws para procesar después
+        const allRawJsons = rawJsonList.map(({ raw, name }) => {
+            const { rawJson } = extractJson(raw);
+            return { rawJson, name };
+        }).filter(x => x.rawJson);
+
+        console.log(`Gemini respondió en ${((Date.now() - t0) / 1000).toFixed(1)}s — ${rawJsonList.length} diagrama(s)`);
 
         // Parsear JSON, reparando truncamientos y limpiando comentarios
         let structure;
@@ -960,86 +848,125 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
 
         // ── Post-procesado: corregir errores comunes del modelo ─────────────
         const stepMap_v = Object.fromEntries(structure.steps.map(s => [s.id, s]));
+        const validIds  = new Set(structure.steps.map(s => s.id));
 
-        // FIX 1: endEvent/endEventMessage con "next" no vacío
-        // Si un endEvent apunta a un intermediateEvent, eliminar ese next del endEvent.
-        // La conexión correcta es: el task ANTERIOR al endEvent → intermediateEvent.
+        // FIX 1: endEvent nunca puede tener next[]
         structure.steps.forEach(step => {
-            if (step.type === 'endEvent' || step.type === 'endEventMessage') {
-                if (step.next && step.next.length > 0) {
-                    console.warn(`FIX: endEvent "${step.id}" tenía next=[${step.next}] — se elimina`);
-                    step.next = [];
-                }
+            if (step.type?.startsWith('endEvent') && step.next?.length) {
+                console.warn(`FIX1: endEvent "${step.id}" tenía next=[${step.next}] — eliminando`);
+                step.next = [];
             }
         });
 
-        // FIX 2: intermediateEvent sin entrada (flotante)
-        // Si un intermediateEvent no tiene ningún nodo que apunte a él,
-        // busca si algún endEvent lo apuntaba antes del fix y reconecta desde el
-        // predecessor lógico (el nodo que apuntaba al endEvent).
-        const allNextIds = new Set(structure.steps.flatMap(s => s.next || []));
+        // FIX 2: eliminar referencias a IDs inexistentes en next[]
         structure.steps.forEach(step => {
-            if ((step.type === 'intermediateEvent' || step.type === 'intermediateEventMessage')
-                && !allNextIds.has(step.id)) {
-                // Find a predecessor: any step in the same or previous role that has no next connection
-                // to this event. Try to connect from the last step of the previous role.
-                const myRoleIdx = structure.roles.indexOf(step.role);
-                if (myRoleIdx > 0) {
-                    const prevRole = structure.roles[myRoleIdx - 1];
-                    const prevSteps = structure.steps.filter(s => s.role === prevRole);
-                    // The last "end" step or last task in prevRole
-                    const lastPrev = prevSteps.filter(s =>
-                        s.type === 'endEvent' || s.type === 'endEventMessage' || s.type === 'userTask' || s.type === 'serviceTask' || s.type === 'scriptTask'
-                    ).pop();
-                    if (lastPrev && !lastPrev.next?.includes(step.id)) {
-                        // If lastPrev is an endEvent, convert it back to a task or just add the connection
-                        if (lastPrev.type === 'endEvent' || lastPrev.type === 'endEventMessage') {
-                            // Change the endEvent to a task that flows forward
-                            console.warn(`FIX: Converting end "${lastPrev.id}" to userTask to connect to floating "${step.id}"`);
-                            lastPrev.type = 'userTask';
-                            lastPrev.next = [step.id];
-                        } else {
-                            console.warn(`FIX: Adding connection ${lastPrev.id} → ${step.id} (was floating)`);
-                            lastPrev.next = [...(lastPrev.next || []), step.id];
-                        }
-                    }
+            const before = (step.next || []).length;
+            step.next = (step.next || []).filter(nid => {
+                if (!validIds.has(nid)) {
+                    console.warn(`FIX2: "${step.id}" apunta a "${nid}" inexistente — eliminado`);
+                    return false;
                 }
-            }
+                return true;
+            });
         });
 
-        // FIX 3: Lenguaje informal en nombres de tareas
-        const informalMap = [
-            [/^presionar?\s+/i,   'Seleccionar '],
-            [/^dar\s+clic\s+/i,   'Seleccionar '],
-            [/^hacer?\s+clic\s+/i,'Seleccionar '],
-            [/^pulsar?\s+/i,      'Activar '],
-            [/^tocar?\s+/i,       'Seleccionar '],
-            [/clic/gi,        ''],
-            [/botón/gi,       'opción'],
-            [/boton/gi,       'opción'],
-        ];
-        structure.steps.forEach(step => {
-            if (step.name) {
-                let name = step.name;
-                informalMap.forEach(([pattern, replacement]) => {
-                    name = name.replace(pattern, replacement);
-                });
-                // Clean up extra spaces
-                name = name.replace(/\s{2,}/g, ' ').trim();
-                if (name !== step.name) {
-                    console.warn(`FIX lenguaje: "${step.name}" → "${name}"`);
-                    step.name = name;
-                }
-            }
-        });
-
-        // Validar que los roles de cada step existen en la lista de roles
+        // FIX 3: roles desconocidos → primer rol
         structure.steps.forEach(step => {
             if (!structure.roles.includes(step.role)) {
-                console.warn(`Step "${step.id}" tiene rol desconocido "${step.role}" — asignando al primer rol`);
+                console.warn(`FIX3: rol desconocido "${step.role}" → ${structure.roles[0]}`);
                 step.role = structure.roles[0];
             }
         });
+
+        // FIX 4: exclusiveGateway sin salidas → conectar a los 2 siguientes en steps[]
+        structure.steps.forEach((step, idx) => {
+            if (step.type === 'exclusiveGateway' && !(step.next?.length)) {
+                const candidates = [];
+                for (let i = idx + 1; i < structure.steps.length && candidates.length < 2; i++) {
+                    if (structure.steps[i].role === step.role) candidates.push(structure.steps[i].id);
+                }
+                if (!candidates.length) {
+                    for (let i = idx + 1; i < structure.steps.length && candidates.length < 2; i++) {
+                        candidates.push(structure.steps[i].id);
+                    }
+                }
+                if (candidates.length) {
+                    step.next = candidates;
+                    if (!step.conditions) step.conditions = {};
+                    candidates.forEach((id, i) => { if (!step.conditions[id]) step.conditions[id] = i === 0 ? 'Sí' : 'No'; });
+                    console.warn(`FIX4: gateway "${step.id}" sin salidas → ${candidates}`);
+                }
+            }
+        });
+
+        // FIX 5: nodos huérfanos (sin incoming) en lanes > 0
+        // Solo el startEvent del primer lane puede no tener incoming.
+        // Si un intermediateEvent no tiene incoming → conectarlo desde el hub o lane anterior.
+        // NUNCA convertir endEvent en userTask — eso crea flujos rotos cross-pool.
+        {
+            const allTargets = new Set(structure.steps.flatMap(s => s.next || []));
+            // Buscar hub de módulos: intermediateEvent con múltiples salidas (menú)
+            const hub = structure.steps.find(s =>
+                s.type === 'intermediateEvent' && (s.next || []).length > 1
+            );
+            structure.roles.forEach((role, ri) => {
+                if (ri === 0) return; // primer lane: el startEvent no necesita incoming
+                const laneSteps = structure.steps.filter(s => s.role === role);
+                if (!laneSteps.length) return;
+                const first = laneSteps[0];
+                if (allTargets.has(first.id)) return; // ya tiene entrada
+
+                // Si el primero es startEvent → convertir a intermediateEvent
+                if (first.type === 'startEvent') {
+                    first.type = 'intermediateEvent';
+                    console.warn(`FIX5: startEvent huérfano "${first.id}" → intermediateEvent`);
+                }
+
+                // Intentar conectar desde hub (menú)
+                if (hub && !hub.next.includes(first.id) && first.type === 'intermediateEvent') {
+                    hub.next.push(first.id);
+                    allTargets.add(first.id);
+                    console.warn(`FIX5: hub "${hub.id}" → "${first.id}"`);
+                    return;
+                }
+
+                // Fallback: conectar desde último nodo no-end del lane anterior
+                const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
+                const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
+                if (connector && !connector.next.includes(first.id)) {
+                    connector.next.push(first.id);
+                    allTargets.add(first.id);
+                    console.warn(`FIX5: "${connector.id}" → "${first.id}" (lane ${ri-1}→${ri})`);
+                }
+            });
+        }
+
+        // FIX 6: nodos sin salida (no-end, no-gateway) → conectar al siguiente en el lane
+        structure.steps.forEach((step, idx) => {
+            if (step.type?.startsWith('endEvent') || step.type === 'exclusiveGateway') return;
+            if ((step.next || []).length > 0) return;
+            const nextInLane = structure.steps.slice(idx + 1).find(n => n.role === step.role);
+            if (nextInLane) {
+                step.next = [nextInLane.id];
+                console.warn(`FIX6: "${step.id}" sin salida → "${nextInLane.id}"`);
+                return;
+            }
+            // Último del lane sin endEvent → agregar uno
+            const laneHasEnd = structure.steps.some(n => n.role === step.role && n.type?.startsWith('endEvent'));
+            if (!laneHasEnd) {
+                const endId = `End_Auto_${step.id}`;
+                structure.steps.push({ id: endId, name: 'Fin', type: 'endEvent', role: step.role, next: [] });
+                step.next = [endId];
+                console.warn(`FIX6: endEvent auto "${endId}" para "${step.id}"`);
+            }
+        });
+
+        // FIX 7: limpiar lenguaje informal
+        const informalMap = [
+            [/^presionar?\s+/i,'Seleccionar '],[/^dar\s+clic\s+/i,'Seleccionar '],
+            [/^hacer?\s+clic\s+/i,'Seleccionar '],[/^pulsar?\s+/i,'Activar '],
+            [/^tocar?\s+/i,'Seleccionar '],[/clic/gi,''],[/botón/gi,'opción'],[/boton/gi,'opción'],
+        ];
 
         // ── Split roles into two pools: Ciudadano and Brigadista ──────────────
         // Detect the split point: first lane with "brigadista" that follows
@@ -1129,11 +1056,59 @@ ${logicXml}
 ${diXml}
 </definitions>`;
 
-        console.log(`✓ BPMN generado — ${structure.steps.length} pasos, ${structure.roles.length} roles`);
+        // ── Procesar diagramas adicionales si hay multi-proceso ──────────
+        const bpmns = [{ name: allRawJsons[0]?.name || 'Proceso Principal', bpmn: finalXml }];
+
+        for (let i = 1; i < allRawJsons.length; i++) {
+            const { rawJson: rj, name } = allRawJsons[i];
+            try {
+                let js = rj.replace(/```json|```/g,'').trim()
+                           .replace(/\/\/[^\n\r"]*/g,'')
+                           .replace(/\/\*[\s\S]*?\*\//g,'')
+                           .replace(/,\s*([}\]])/g,'$1');
+                if (!js.trimEnd().endsWith('}')) {
+                    const lb = js.lastIndexOf('}');
+                    if (lb > 0) js = js.substring(0, lb+1) + '\n  ]\n}';
+                }
+                const struct = JSON.parse(js);
+                if (!struct.roles?.length || !struct.steps?.length) throw new Error('sin roles/pasos');
+
+                const pid = `Process_${Date.now()}_${i}`;
+                const di  = generateDI(struct, pid, { poolY: 60, poolId: `Participant_${i+1}`, poolName: name });
+                const xml = `<?xml version="1.0" encoding="utf-8"?>
+<definitions
+  xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+  xsi:schemaLocation="http://www.omg.org/spec/BPMN/20100524/MODEL http://www.omg.org/spec/BPMN/20100524/MODEL/BPMN20.xsd"
+  id="Definitions_${i+1}"
+  targetNamespace="http://www.bizagi.com/definitions/20250226143500"
+  exporter="Bizagi Modeler"
+  exporterVersion="3.4.0.013">
+  <collaboration id="Collaboration_${i+1}">
+    <participant id="Participant_${i+1}" name="${xmlEscape(name)}" processRef="${pid}"/>
+  </collaboration>
+${generateLogic(struct, pid)}
+  <bpmndi:BPMNDiagram id="BPMNDiagram_${i+1}" name="${xmlEscape(name)}">
+    <bpmndi:BPMNPlane id="BPMNDiagram_${i+1}_Plane" bpmnElement="Collaboration_${i+1}">
+${di.shapesXml}${di.edgesXml}    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>`;
+                bpmns.push({ name, bpmn: xml });
+                console.log(`✓ BPMN adicional: "${name}" — ${struct.steps.length} pasos`);
+            } catch(e) {
+                console.warn(`WARN: diagrama extra "${name}" falló: ${e.message}`);
+            }
+        }
+
+        console.log(`✓ Total BPMNs generados: ${bpmns.length} — ${structure.steps.length} pasos en el principal`);
         res.json({
             success: true,
             data:    mdMatch ? mdMatch[1].trim() : 'Análisis completado.',
-            bpmn:    finalXml,
+            bpmn:    bpmns[0].bpmn,   // compatibilidad frontend existente
+            bpmns,                     // array completo [{name, bpmn}]
         });
 
     } catch (error) {
@@ -1150,3 +1125,169 @@ const server = app.listen(4000, () =>
 );
 server.timeout          = CONFIG.timeout;
 server.keepAliveTimeout = CONFIG.timeout;
+// ============================================================
+// 8. ENDPOINT DE DIAGNÓSTICO — /debug
+// Procesa el PDF igual que /analyze pero devuelve texto plano
+// describiendo qué sistemas detectó y qué estructura generaría,
+// sin construir ningún XML. Útil para verificar el output de Gemini.
+// ============================================================
+app.post('/debug', upload.single('file'), async (req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+
+    try {
+        if (!req.file) return res.status(400).send('ERROR: Archivo no recibido.');
+
+        const pdfData    = await pdf(req.file.buffer);
+        const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
+        const manualText = rawText.substring(0, CONFIG.maxPdfChars);
+        if (manualText.length < 100) return res.status(400).send('ERROR: PDF sin texto extraíble.');
+
+        const lines = [];
+        const log = (...args) => { const msg = args.join(' '); console.log(msg); lines.push(msg); };
+
+        log('═══════════════════════════════════════════════');
+        log('DIAGNÓSTICO DE PROCESAMIENTO');
+        log('═══════════════════════════════════════════════');
+        log(`PDF leído: ${manualText.length} chars`);
+        log(`Primeros 300 chars del texto extraído:`);
+        log(manualText.substring(0, 300));
+        log('───────────────────────────────────────────────');
+
+        const model = genAI.getGenerativeModel({
+            model: CONFIG.model,
+            generationConfig: { temperature: CONFIG.temperature, maxOutputTokens: CONFIG.maxTokens },
+        });
+
+        async function callWithRetry(prompt, maxRetries = 3) {
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    const r = await model.generateContent(prompt);
+                    return r.response.text();
+                } catch(e) {
+                    const msg = e.message || '';
+                    const retry = (msg.includes('503') || msg.includes('429')) && attempt < maxRetries - 1;
+                    if (retry) {
+                        const wait = (attempt + 1) * 15000;
+                        log(`Gemini saturado — esperando ${wait/1000}s...`);
+                        await new Promise(r => setTimeout(r, wait));
+                    } else throw e;
+                }
+            }
+        }
+
+        // ── PASO 1: Detectar sistemas ────────────────────────
+        log('\nPASO 1 — DETECCIÓN DE SISTEMAS');
+        log('Enviando prompt de detección a Gemini...');
+
+        const detectPrompt = buildPromptDetect(manualText);
+        log(`Tamaño del prompt de detección: ${detectPrompt.length} chars`);
+
+        const detectRaw = await callWithRetry(detectPrompt);
+        log(`\nRespuesta RAW de Gemini (detección completa):`);
+        log('---');
+        log(detectRaw);
+        log('---');
+
+        // Parsear
+        let sistemas = null;
+        const intentos = [
+            detectRaw,
+            detectRaw.replace(/```json|```/gi, '').trim(),
+            detectRaw.substring(detectRaw.indexOf('{'), detectRaw.lastIndexOf('}') + 1),
+        ];
+        for (const intento of intentos) {
+            try {
+                const parsed = JSON.parse(intento);
+                const arr = parsed.sistemas || parsed.actores || parsed.systems;
+                if (Array.isArray(arr) && arr.length > 0) { sistemas = arr; break; }
+            } catch(e) { /* continuar */ }
+        }
+
+        if (!sistemas) {
+            log('\n⚠ PARSE FALLÓ — no se pudo extraer array de sistemas del JSON');
+            log('Usando sistema genérico de fallback');
+            sistemas = [{ nombre: 'Sistema Principal', descripcion: 'Flujo principal del manual' }];
+        } else {
+            log(`\n✓ Sistemas parseados correctamente: ${sistemas.length}`);
+        }
+
+        log(`\nSISTEMAS DETECTADOS (${sistemas.length}):`);
+        sistemas.forEach((s, i) => log(`  ${i+1}. "${s.nombre}" — ${s.descripcion}`));
+
+        // ── PASO 2: Por cada sistema, pedir solo el JSON de estructura ──
+        log('\n═══════════════════════════════════════════════');
+        log('PASO 2 — ESTRUCTURA DE CADA DIAGRAMA');
+        log('═══════════════════════════════════════════════');
+
+        for (let i = 0; i < sistemas.length; i++) {
+            const sistema = sistemas[i];
+            const otros   = sistemas.filter((_, j) => j !== i).map(s => s.nombre);
+            log(`\n── Diagrama ${i+1}: "${sistema.nombre}" ──`);
+
+            try {
+                const raw = await callWithRetry(buildPromptDiagram(manualText, sistema.nombre, sistema.descripcion || '', otros));
+
+                // Intentar parsear para mostrar resumen
+                let estructura = null;
+                try {
+                    let js = raw.replace(/```json|```/g,'').trim();
+                    js = js.replace(/,\s*([}\]])/g,'$1');
+                    estructura = JSON.parse(js);
+                } catch(e) {
+                    // Intentar extraer JSON del medio del texto
+                    const start = raw.indexOf('{');
+                    const end   = raw.lastIndexOf('}');
+                    if (start >= 0 && end > start) {
+                        try { estructura = JSON.parse(raw.substring(start, end+1)); } catch(_) {}
+                    }
+                }
+
+                if (estructura) {
+                    log(`  ✓ JSON parseado correctamente`);
+                    log(`  name: "${estructura.name}"`);
+                    log(`  roles (${estructura.roles?.length ?? 0}): ${(estructura.roles || []).join(' | ')}`);
+                    log(`  steps total: ${estructura.steps?.length ?? 0}`);
+
+                    // Contar nodos por tipo
+                    const byType = {};
+                    (estructura.steps || []).forEach(s => { byType[s.type] = (byType[s.type]||0)+1; });
+                    log(`  tipos: ${JSON.stringify(byType)}`);
+
+                    // Contar nodos por rol
+                    const byRole = {};
+                    (estructura.roles || []).forEach(r => { byRole[r] = 0; });
+                    (estructura.steps || []).forEach(s => { if (byRole[s.role] !== undefined) byRole[s.role]++; });
+                    log(`  por rol:`);
+                    Object.entries(byRole).forEach(([r, n]) => log(`    • ${r}: ${n} nodos`));
+
+                    // Verificar integridad básica
+                    const ids = new Set((estructura.steps||[]).map(s => s.id));
+                    let broken = 0;
+                    (estructura.steps||[]).forEach(s => {
+                        (s.next||[]).forEach(nid => { if (!ids.has(nid)) broken++; });
+                    });
+                    const noNext = (estructura.steps||[]).filter(s =>
+                        !s.type?.startsWith('endEvent') && !(s.next?.length > 0)
+                    ).length;
+                    log(`  referencias rotas: ${broken}`);
+                    log(`  nodos sin next[]: ${noNext}`);
+                } else {
+                    log(`  ✗ JSON NO pudo parsearse`);
+                    log(`  Respuesta RAW (primeros 500 chars):`);
+                    log(raw.substring(0, 500));
+                }
+            } catch(e) {
+                log(`  ✗ ERROR llamando Gemini: ${e.message}`);
+            }
+        }
+
+        log('\n═══════════════════════════════════════════════');
+        log('FIN DEL DIAGNÓSTICO');
+        log('═══════════════════════════════════════════════');
+
+        res.send(lines.join('\n'));
+
+    } catch(error) {
+        res.status(500).send(`ERROR CRÍTICO: ${error.message}\n${error.stack}`);
+    }
+});
