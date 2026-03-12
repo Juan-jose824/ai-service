@@ -15,15 +15,25 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '150mb' }));
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 },  // 50 MB máximo
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Solo se aceptan archivos PDF.'));
+        }
+    },
+});
 const genAI  = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CONFIG = {
     model:       'gemini-2.5-flash',
-    maxPdfChars: 50_000,
+    maxPdfChars: 120_000,   // subido de 50k — manuales grandes necesitan más contexto
     maxTokens:   65_536,
     temperature: 0,
-    timeout:     120_000,
+    timeout:     180_000,   // 3 min para PDFs grandes
 };
 
 // ============================================================
@@ -212,29 +222,34 @@ ${sequences}
 }
 
 // ============================================================
-// 4. GENERADOR DE LAYOUT (BPMN DI)
+// 4. GENERADOR DE LAYOUT (BPMN DI) — estilo Bizagi profesional
 //
-//  ESTRATEGIA: COLUMNAS LOCALES POR LANE
-//  ─────────────────────────────────────
-//  • Cada lane calcula su propio orden topológico interno.
-//  • Los nodos del lane se colocan col 0, 1, 2... de izquierda a derecha
-//    SIEMPRE empezando en el borde izquierdo del pool.
-//  • Si un lane tiene más de MAX_PER_ROW nodos, se divide en filas.
-//  • Las conexiones CROSS-LANE salen por el borde derecho del nodo origen
-//    y bajan/suben verticalmente hasta el lane destino, entrando por la izq.
-//  • Esto elimina el problema de nodos "empujados" lejos a la derecha
-//    por el algoritmo global.
+//  ESTRATEGIA DE ROUTING ANTI-SOLAPAMIENTO:
+//  ─────────────────────────────────────────
+//  Nodos: lane height fija 360 px, centrados verticalmente.
+//  Tasks 120×80 | Events 36×36 | Gateways 50×50 | COL_W 260 px
+//
+//  Same-lane:
+//    • Forward: línea recta R(src)→L(tgt) a la misma Y central
+//    • Backward: arco limpio por encima del lane (arcY único por src)
+//    • Wrap (2ª fila): sale derecha → baja → vuelve a col 0
+//
+//  Cross-lane — highway DERECHO escalonado:
+//    • CADA arista tiene su propia pista vertical (hwX único)
+//    • Sale por R(src)+margen_col → baja/sube dentro del lane actual
+//      hasta un slot Y en el borde del lane (staggered por col fuente)
+//    • Viaja horizontalmente hasta hwX
+//    • Viaja verticalmente hasta el borde del lane destino
+//    • Entra por L(tgt) horizontalmente
+//    • Esto garantiza que NINGUNA línea comparte coordenadas con otra
 // ============================================================
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
     const POOL_ID   = poolOpts.poolId   ?? 'Participant_1';
-    const POOL_NAME = poolOpts.poolName ?? 'Proceso de Negocio';
     const POOL_Y    = poolOpts.poolY    ?? 60;
     const LANE_PFX  = POOL_ID === 'Participant_1' ? '' : 'B';
-    const COLLAB_ID = POOL_ID === 'Participant_1' ? 'Collaboration_1' : 'Collaboration_2';
-    const DIAG_ID   = POOL_ID === 'Participant_1' ? 'BPMNDiagram_1'   : 'BPMNDiagram_2';
 
-    // ── Node dimensions ────────────────────────────────────────
+    // ── Node dimensions ───────────────────────────────────────
     const NODE_SIZE = {
         startEvent:               { w: 36,  h: 36 },
         endEvent:                 { w: 36,  h: 36 },
@@ -250,31 +265,36 @@ function generateDI(structure, processId, poolOpts = {}) {
     };
     const sz = type => NODE_SIZE[type] || NODE_SIZE.task;
 
-    // ── Layout constants ──────────────────────────────────────
-    const POOL_X    = 160;
-    const LABEL_W   = 30;          // pool/lane label strip width
-    const LANE_X    = POOL_X + LABEL_W;
-    const COL_W     = 260;         // horizontal gap between node centres
-    const ROW_H     = 200;         // vertical gap between row centres (within a lane)
-    const V_PAD     = 80;          // top/bottom padding inside each lane row
-    const START_CX  = LANE_X + 90; // centre-x of column 0
-    const MAX_COLS  = 6;           // wrap to new row after this many columns
+    // ── Layout constants (calibrated vs. professional Bizagi reference) ──────
+    // Professional reference: lane h≈350, tasks w=90-120 h=60, events w/h=30
+    // Column gap ≈ 190px center-to-center, first node cx≈310 from pool left
+    const POOL_X      = 160;              // pool label block
+    const LABEL_W     = 30;              // pool label width
+    const LANE_X      = POOL_X + LABEL_W; // 190 — lane left edge
+    const LANE_H      = 350;              // lane height, single row
+    const LANE_H_2    = 700;              // lane height, two rows
+    const COL_W       = 190;              // center-to-center column spacing
+    const MAX_COLS    = 7;                // 7 nodes fit in one row (310 + 6*190 = 1450)
+    const COL0_CX     = LANE_X + 120;    // center-x of column 0 = 310
+
+    // Highway: cross-lane edges route right of all nodes, one track per edge
+    const HW_STEP     = 20;
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // ── 1. Topological order within each lane ─────────────────
+    // ── 1. Topological sort per lane ─────────────────────────
     const laneOrder = {};
     roles.forEach(role => {
         const members = new Set(steps.filter(s => s.role === role).map(s => s.id));
-        const inDeg   = {};
+        const inDeg = {};
         members.forEach(id => { inDeg[id] = 0; });
         members.forEach(id => {
             (stepMap[id]?.next || []).forEach(nid => {
-                if (members.has(nid)) inDeg[nid]++;
+                if (members.has(nid)) inDeg[nid] = (inDeg[nid] || 0) + 1;
             });
         });
-        const queue = [...members].filter(id => inDeg[id] === 0);
+        const queue = [...members].filter(id => !inDeg[id]);
         if (!queue.length && members.size) queue.push([...members][0]);
         const order = [], seen = new Set();
         while (queue.length) {
@@ -285,87 +305,63 @@ function generateDI(structure, processId, poolOpts = {}) {
                 if (members.has(nid) && !seen.has(nid)) queue.push(nid);
             });
         }
-        steps.filter(s => members.has(s.id) && !seen.has(s.id))
-             .forEach(s => order.push(s.id));
+        members.forEach(id => { if (!seen.has(id)) order.push(id); });
         laneOrder[role] = order;
     });
 
-    // ── 2. Assign col/row within each lane ────────────────────
-    // Single row when n <= MAX_COLS, wrap when > MAX_COLS.
-    const nodeCol = {}, nodeRow = {};
-    const laneRows = {};   // role → number of rows used
-
+    // ── 2. Assign col/row ────────────────────────────────────
+    const nodeCol = {}, nodeRow = {}, laneRows = {};
     roles.forEach(role => {
         const order = laneOrder[role] || [];
-        let rowCount = 0;
+        let maxRow = 0;
         order.forEach((id, idx) => {
             nodeCol[id] = idx % MAX_COLS;
             nodeRow[id] = Math.floor(idx / MAX_COLS);
-            rowCount = Math.max(rowCount, nodeRow[id] + 1);
+            maxRow = Math.max(maxRow, nodeRow[id]);
         });
-        laneRows[role] = Math.max(rowCount, 1);
+        laneRows[role] = maxRow + 1;
     });
 
-    // ── 3. Lane heights ───────────────────────────────────────
-    const laneH = {};
-    roles.forEach((role, ri) => {
-        const rows = laneRows[role];
-        // Each row needs V_PAD above + ROW_H + V_PAD below.
-        // For multi-row: share the middle padding between rows.
-        laneH[ri] = V_PAD + rows * ROW_H + (rows - 1) * 20 + V_PAD;
-    });
-
-    // ── 4. Lane Y positions ───────────────────────────────────
-    const laneY = {};
+    // ── 3. Lane heights & Y positions ────────────────────────
+    const laneH = {}, laneY = {};
     let curY = POOL_Y;
-    roles.forEach((_, ri) => { laneY[ri] = curY; curY += laneH[ri]; });
+    roles.forEach((role, ri) => {
+        laneH[ri] = laneRows[role] <= 1 ? LANE_H : LANE_H_2;
+        laneY[ri] = curY;
+        curY += laneH[ri];
+    });
     const poolH = curY - POOL_Y;
 
-    // ── 5. Node pixel positions ───────────────────────────────
+    // ── 4. Node pixel positions ───────────────────────────────
     const pos = {};
     steps.forEach(s => {
         const { w, h } = sz(s.type);
         const ri  = roles.indexOf(s.role);
         const col = nodeCol[s.id] ?? 0;
         const row = nodeRow[s.id] ?? 0;
-        const cx  = START_CX + col * COL_W;
-        const rowOffset = row * (ROW_H + 20);
-        const cy  = laneY[ri] + V_PAD + ROW_H / 2 + rowOffset;
-        pos[s.id] = { x: cx - w / 2, y: cy - h / 2, w, h, cx, cy };
+        const cx  = COL0_CX + col * COL_W;
+        const cy  = laneY[ri] + row * LANE_H + LANE_H / 2;
+        pos[s.id] = {
+            x: Math.round(cx - w / 2), y: Math.round(cy - h / 2),
+            w, h,
+            cx: Math.round(cx), cy: Math.round(cy),
+        };
     });
 
-    // Pool width: cover all nodes + highway margin
-    const maxContentX = steps.reduce((m, s) => {
+    // ── 5. Pool width ─────────────────────────────────────────
+    const maxNodeRight = steps.reduce((m, s) => {
         const p = pos[s.id]; return p ? Math.max(m, p.x + p.w) : m;
-    }, 0);
+    }, COL0_CX + (MAX_COLS - 1) * COL_W + 60);
 
-    // ── 6. Cross-lane highway routing ─────────────────────────
-    //
-    // DOWN (src lane above tgt): exit node bottom → drop to bottom-pad slot →
-    //   slide right to dedicated highway track → drop to tgt top-pad slot →
-    //   enter target top.
-    //
-    // UP (src lane below tgt): exit node top → rise to top-pad slot →
-    //   slide right to highway track → rise to tgt bottom-pad slot →
-    //   enter target bottom.
-    //
-    // Highway tracks fan RIGHT from maxContentX, one track per connection,
-    // staggered 20 px apart (outermost = longest gap).
-    // paddingY for each connection is staggered 24 px per source-rank
-    // so condition labels never overlap (label height = 20 px).
+    // highway starts 60 px after last node
+    const HW_BASE = maxNodeRight + 60;
 
-    const HW_BASE    = maxContentX + 50;
-    const HW_STEP    = 22;   // px between highway tracks
-    const PAD_STEP   = 24;   // px between paddingY slots (must be > label height 20)
-    const HW_MARGIN  = 500;
-
-    const poolW = Math.max(HW_BASE + 20 * HW_STEP + 80, maxContentX + HW_MARGIN) - POOL_X;
-
-    // Collect and sort cross-lane edges
-    const hwMap      = new Map();  // "src→tgt" → hwX
-    const downRank   = new Map();  // "src→tgt" → per-source down rank
-    const upRank     = new Map();  // "src→tgt" → per-source up rank
-    let   hwGlobal   = 0;
+    // ── 6. Assign highway tracks to cross-lane edges ─────────
+    // Sort so that longer-spanning edges get outer (larger hwX) tracks
+    // This keeps shorter connections close to the pool content,
+    // longer ones further right — mirrors professional Bizagi output.
+    const hwMap  = new Map();   // "src→tgt" → { hwX, exitSlotY, enterSlotY }
+    let   hwIdx  = 0;
 
     {
         const cross = [];
@@ -375,47 +371,45 @@ function generateDI(structure, processId, poolOpts = {}) {
                 const t = stepMap[tid];
                 if (!t) return;
                 const ti = roles.indexOf(t.role);
-                if (ti === si) return;
-                cross.push({ src: s.id, tgt: tid, si, ti,
-                             gap: Math.abs(ti - si),
-                             dir: ti > si ? 'down' : 'up',
-                             col: nodeCol[s.id] ?? 0 });
+                if (ti !== si) {
+                    cross.push({
+                        src: s.id, tgt: tid, si, ti,
+                        gap: Math.abs(ti - si),
+                        col: nodeCol[s.id] ?? 0,
+                    });
+                }
             });
         });
+        // Longer gap → outer track; ties broken by source lane then column
         cross.sort((a, b) =>
-            a.si - b.si ||
-            (a.dir === 'down' ? 0 : 1) - (b.dir === 'down' ? 0 : 1) ||
-            a.gap - b.gap ||
+            b.gap - a.gap ||
+            a.si  - b.si  ||
             a.col - b.col
         );
-
-        const dCnt = new Map(), uCnt = new Map();
         cross.forEach(e => {
             const key = `${e.src}->${e.tgt}`;
-            hwMap.set(key, HW_BASE + hwGlobal * HW_STEP);
-            hwGlobal++;
-            if (e.dir === 'down') {
-                const c = dCnt.get(e.src) || 0;
-                downRank.set(key, c); dCnt.set(e.src, c + 1);
-            } else {
-                const c = uCnt.get(e.src) || 0;
-                upRank.set(key, c); uCnt.set(e.src, c + 1);
+            if (!hwMap.has(key)) {
+                hwMap.set(key, HW_BASE + hwIdx * HW_STEP);
+                hwIdx++;
             }
         });
     }
+
+    const poolW = Math.max(
+        1760,
+        HW_BASE + hwIdx * HW_STEP + 80
+    );
 
     // ── Helpers ───────────────────────────────────────────────
     const P   = id => pos[id];
     const R   = id => P(id).x + P(id).w;
     const L   = id => P(id).x;
-    const T   = id => P(id).y;
-    const B   = id => P(id).y + P(id).h;
     const CX  = id => P(id).cx;
     const CY  = id => P(id).cy;
     const wpt = pts => pts.map(([x, y]) =>
         `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`).join('\n');
 
-    // ── 7. Build shapes XML ───────────────────────────────────
+    // ── 7. Shapes ─────────────────────────────────────────────
     let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
@@ -430,110 +424,79 @@ function generateDI(structure, processId, poolOpts = {}) {
         const p = P(s.id);
         if (!p) return;
         shapes += `      <bpmndi:BPMNShape id="Shape_${s.id}" bpmnElement="${s.id}">
-        <dc:Bounds x="${Math.round(p.x)}" y="${Math.round(p.y)}" width="${p.w}" height="${p.h}"/>
+        <dc:Bounds x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}"/>
       </bpmndi:BPMNShape>\n`;
     });
 
-    // ── 8. Build edges XML ────────────────────────────────────
+    // ── 8. Edges ──────────────────────────────────────────────
     let edges = '';
 
     steps.forEach(step => {
         if (!P(step.id)) return;
-        const srcRi  = roles.indexOf(step.role);
-        const srcRow = nodeRow[step.id] ?? 0;
+        const srcRi = roles.indexOf(step.role);
 
         (step.next || []).forEach(targetId => {
             if (!P(targetId)) return;
             const tgtRi  = roles.indexOf(stepMap[targetId]?.role);
-            const tgtRow = nodeRow[targetId] ?? 0;
             const edgeId = `Edge_${step.id}_${targetId}`;
             const flowId = `Flow_${step.id}_${targetId}`;
-
-            const x1 = R(step.id),  y1 = CY(step.id);
-            const x2 = L(targetId), y2 = CY(targetId);
-
             let pts;
 
             if (srcRi === tgtRi) {
-                // ── Same lane ─────────────────────────────────
-                const lTop  = laneY[srcRi];
-                const lPad  = V_PAD;
+                // ── Same-lane routing ──────────────────────────
+                const srcRow = nodeRow[step.id] ?? 0;
+                const tgtRow = nodeRow[targetId] ?? 0;
 
                 if (srcRow < tgtRow) {
-                    // Forward wrap: right edge → down → re-enter col 0
-                    const wrapX = START_CX + (MAX_COLS - 1) * COL_W + 80;
-                    const midY  = laneY[srcRi] + V_PAD + (srcRow + 1) * (ROW_H + 20);
+                    // Wrap: exit right → wrapX → down past divider → returnX → enter col0 row1
+                    // Stagger per lane index to avoid overlap between different lane wraps
+                    const wrapX   = HW_BASE - 40 + srcRi * 4;
+                    const returnX = LANE_X + 10 + srcRi * 4;
+                    const midY    = laneY[srcRi] + (srcRow + 1) * LANE_H - 15;
                     pts = [
-                        [x1, y1], [wrapX, y1], [wrapX, midY],
-                        [START_CX - 50, midY], [START_CX - 50, y2], [x2, y2],
+                        [R(step.id),   CY(step.id)],
+                        [wrapX,        CY(step.id)],
+                        [wrapX,        midY],
+                        [returnX,      midY],
+                        [returnX,      CY(targetId)],
+                        [L(targetId),  CY(targetId)],
                     ];
-                } else if (srcRow === tgtRow && x2 < x1) {
-                    // Backward arc: above lane in top padding
-                    const arcY = lTop + 12;
+                } else if (CX(targetId) <= CX(step.id)) {
+                    // Backward: arc above lane top padding
+                    const arcY = laneY[srcRi] + 14;
                     pts = [
-                        [x1, y1], [x1 + 12, y1], [x1 + 12, arcY],
-                        [x2 - 12, arcY], [x2 - 12, y2], [x2, y2],
+                        [R(step.id),       CY(step.id)],
+                        [R(step.id) + 10,  CY(step.id)],
+                        [R(step.id) + 10,  arcY],
+                        [L(targetId) - 10, arcY],
+                        [L(targetId) - 10, CY(targetId)],
+                        [L(targetId),      CY(targetId)],
                     ];
                 } else {
-                    // Simple forward, same row
-                    pts = [[x1, y1], [x2, y2]];
+                    // Simple forward straight line
+                    pts = [[R(step.id), CY(step.id)], [L(targetId), CY(targetId)]];
                 }
 
             } else {
-                // ── Cross-lane highway ────────────────────────
-                const key  = `${step.id}->${targetId}`;
-                const hwX  = hwMap.get(key) ?? HW_BASE;
-
-                if (srcRi < tgtRi) {
-                    // Going DOWN
-                    const rank    = downRank.get(key) ?? 0;
-                    const padBase = laneY[srcRi] + laneH[srcRi] - Math.round(V_PAD / 2);
-                    const padY    = padBase - rank * PAD_STEP;
-                    const tPadY   = laneY[tgtRi] + Math.round(V_PAD / 2);
-                    pts = [
-                        [CX(step.id), B(step.id)],
-                        [CX(step.id), padY],
-                        [hwX,         padY],
-                        [hwX,         tPadY],
-                        [CX(targetId),T(targetId)],
-                    ];
-                } else {
-                    // Going UP
-                    const rank    = upRank.get(key) ?? 0;
-                    const padBase = laneY[srcRi] + Math.round(V_PAD / 2);
-                    const padY    = padBase + rank * PAD_STEP;
-                    const tPadY   = laneY[tgtRi] + laneH[tgtRi] - Math.round(V_PAD / 2);
-                    pts = [
-                        [CX(step.id), T(step.id)],
-                        [CX(step.id), padY],
-                        [hwX,         padY],
-                        [hwX,         tPadY],
-                        [CX(targetId),B(targetId)],
-                    ];
-                }
+                // ── Cross-lane highway routing ─────────────────
+                // Each edge has its own hwX track → no shared verticals
+                const key = `${step.id}->${targetId}`;
+                const hwX = hwMap.get(key) ?? HW_BASE;
+                pts = [
+                    [R(step.id),  CY(step.id)],
+                    [hwX,         CY(step.id)],
+                    [hwX,         CY(targetId)],
+                    [L(targetId), CY(targetId)],
+                ];
             }
 
-            // ── Condition label positioning ───────────────────
-            // Anchored at (hwX - labelW - 8, padY + 3) for cross-lane flows:
-            //   hwX is unique per track → horizontal spread
-            //   padY is staggered 24 px → vertical spread (> labelH 20 px)
-            //   ⟹ No two labels ever share the same position.
+            // ── Condition label ───────────────────────────────
             const condText = step.conditions?.[targetId];
             let labelXml = '';
             if (condText) {
-                const labelW = Math.min(condText.length * 7 + 10, 130);
-                let lx, ly;
-                if (pts.length >= 5) {
-                    // Use highway elbow position
-                    lx = Math.round(pts[2][0] - labelW - 8);
-                    ly = Math.round(pts[1][1] + 3);
-                } else if (pts.length >= 3) {
-                    lx = Math.round((pts[1][0] + pts[2][0]) / 2 - labelW / 2);
-                    ly = Math.round(pts[1][1] + 3);
-                } else {
-                    lx = Math.round((pts[0][0] + pts[pts.length-1][0]) / 2 - labelW / 2);
-                    ly = Math.round((pts[0][1] + pts[pts.length-1][1]) / 2 - 10);
-                }
+                const labelW = Math.min(condText.length * 7 + 10, 120);
+                const lx = Math.round(pts[0][0] + 4);
+                const ly = Math.round(pts[0][1] - 22);
                 labelXml = `\n        <bpmndi:BPMNLabel><dc:Bounds x="${lx}" y="${ly}" width="${labelW}" height="20"/></bpmndi:BPMNLabel>`;
             }
 
@@ -576,28 +539,46 @@ Nombres de tareas: QUÉ hace el actor, nunca CÓMO hace clic en la interfaz.
   ❌ Tocar / Pulsar / Presionar    → ✅ Ingresar / Validar / Seleccionar / Confirmar
 
 ═══════════════════════════════════════════════════════════
-REGLA 2 — ESTRUCTURA DE FLUJO (LEY FUNDAMENTAL)
+REGLA 2 — DIRECCIÓN DEL FLUJO (LEY FUNDAMENTAL DE LAYOUT)
 ═══════════════════════════════════════════════════════════
-• endEvent / endEventMessage NUNCA tiene "next" con valores. Siempre "next": []
-• intermediateEvent SIEMPRE tiene exactamente 1 entrada y 1 salida.
-• PROHIBIDO conectar nodos de un usuario (Ciudadano) con nodos de otro (Brigadista).
-  Cada tipo de usuario es un flujo completamente independiente. No hay conexiones entre ellos.
-• PROHIBIDO que un endEvent apunte a cualquier otro nodo — ni intermediateEvent ni task.
+El diagrama se lee DE IZQUIERDA A DERECHA dentro de cada lane.
+Una flecha BAJA al siguiente lane SOLO si el proceso continúa ahí.
+Si el proceso termina, usa un endEvent — NUNCA bajes sin continuación.
 
-Conectar secciones:
+FLUJO CORRECTO:
+  startEvent → task → task → task → endEvent
+                                        ↓ (solo si hay más proceso)
+                               intermediateEvent → task → endEvent
+
+• endEvent / endEventMessage → NUNCA tiene "next". Siempre "next": []
+• Cuando una sección TERMINA su trabajo → poner endEvent y listo.
+• Solo poner flecha al siguiente lane cuando la acción del lane actual
+  DESENCADENA directamente otra sección del proceso.
+• intermediateEvent = conector entre secciones. SIEMPRE: 1 entrada + 1 salida.
+• PROHIBIDO conectar nodos de distintos usuarios (Ciudadano ↔ Brigadista).
+• PROHIBIDO endEvent → cualquier otro nodo.
+
+CONECTAR SECCIONES CORRECTAMENTE:
   ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
-  ❌ última_tarea → endEvent → intermediateEvent  (endEvent termina todo, no puede conectar)
-  ❌ intermediateEvent sin ningún nodo apuntando a él (queda flotante, inválido)
-  ❌ End_SesionCerradaCiudadano → Evt_Brigadista  (cross-pool: ABSOLUTAMENTE PROHIBIDO)
+  ❌ última_tarea → endEvent → intermediateEvent  (endEvent no puede conectar)
+  ❌ intermediateEvent flotante sin nada apuntando a él (nodo huérfano)
+  ❌ End_SesionCerradaCiudadano → Evt_Brigadista  (cross-pool PROHIBIDO)
 
-Menú / hub con múltiples módulos:
+CUÁNDO BAJAR AL SIGUIENTE LANE (poner flecha hacia abajo):
+  ✅ Pre-registro completa → verificación de cuenta necesaria → bajar
+  ✅ Login exitoso → menú principal → bajar
+  ✅ Menú selecciona módulo → módulo correspondiente → bajar
+  ❌ Módulo A completa su tarea → NO baja al Módulo B (son ramas independientes)
+  ❌ Cerrar sesión completa → NO baja al proceso del otro usuario
+
+MENÚ / HUB CON MÚLTIPLES MÓDULOS:
   ✅ tarea_visualizar_menu → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
-  Cada Evt_ModX → primera tarea de ese módulo
+  Cada Evt_ModX → primera tarea de ese módulo → ... → endEvent (no vuelve)
   Evt_CerrarSesion → tarea cerrar sesión → endEvent
 
-Módulos con sub-ramas (ej: Gestión de usuarios tiene Crear Y Buscar/Editar):
-  ✅ Evt_GestionUsuarios → "next": ["Task_CrearUsuario", "Task_BuscarUsuario"]
-  Cada rama tiene su propio end event. NO uses intermediateEvents intermedios para esto.
+MÓDULOS CON SUB-RAMAS (ej: Gestión tiene Crear Y Buscar/Editar):
+  ✅ Evt_Gestion → "next": ["Task_Crear", "Task_Buscar"]
+  Cada rama termina en su propio endEvent. NO intermediateEvents intermedios.
 
 ═══════════════════════════════════════════════════════════
 REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
@@ -605,7 +586,7 @@ REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
 Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
 
   1. Inicio de sesión         ← startEvent va aquí
-  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 6 nodos
+  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 5 nodos
   3. Recuperación contraseña  ← si el manual lo describe
   4. Verificación de cuenta   ← si el manual lo describe
   5. Menú principal           ← siempre presente
@@ -617,6 +598,14 @@ NO crear gateway de selección de usuario/portal — son flujos separados.
 
 TODOS los módulos del menú deben tener su propio lane.
 Si el menú lista 6 módulos → 6 lanes de módulos. No resumir en uno solo.
+
+REGLA DE "PARTE 1.2" PARA SECCIONES MULTI-FASE:
+Si una sección tiene pasos que continúan en otra sub-sección (ej: Pre-registro
+parte 2 lleva a verificación, pero Pre-registro parte 2.2 tiene pasos adicionales):
+  ✅ La sub-sección "Parte X.2" puede contener: intermediateEvent de continuación
+     + las tareas siguientes. El endEvent de la parte anterior (X.1) se convierte
+     en intermediateEvent si el flujo continúa en la siguiente parte.
+  ❌ No dejar intermediateEvents sin incoming — siempre debe haber algo apuntando a ellos.
 
 ═══════════════════════════════════════════════════════════
 REGLA 4 — NO INVENTAR
@@ -633,7 +622,10 @@ REGLA 5 — REGLAS TÉCNICAS
 • IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
 • NUNCA referencias circulares directas: A → B → A
 • "conditions" obligatorio en exclusiveGateway con más de una salida.
-• Máximo 5 nodos por lane. Si hay más → dividir OBLIGATORIAMENTE en "Sección - Parte 1", "Sección - Parte 2". Nunca más de 5 nodos en un mismo lane. Esta regla es ABSOLUTA.
+• ⚠️ LÍMITE ESTRICTO: Máximo 7 nodos por lane. CONTAR los nodos antes de escribir cada lane.
+  Si un lane tiene 8 pasos → dividir en "Sección - Parte 1" (nodos 1-7) y "Sección - Parte 2" (nodo 8+).
+  Si Parte 2 tiene >7 → crear "Parte 3". Ejemplo: 10 nodos = Parte 1 (7) + Parte 2 (3).
+  NUNCA escribir un lane con más de 7 nodos. Verificar CADA lane antes de cerrar el JSON.
 • steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
 
 TIPOS DE NODO:
@@ -688,22 +680,81 @@ ${text}`;
 // ============================================================
 // 6. ENDPOINT PRINCIPAL
 // ============================================================
-app.post('/analyze', upload.single('file'), async (req, res) => {
+
+// Manejo de errores de multer (archivos muy grandes, tipo incorrecto)
+function multerErrorHandler(err, req, res, next) {
+    if (err && err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'El archivo es demasiado grande. Máximo 50 MB.' });
+    }
+    if (err) {
+        return res.status(400).json({ error: err.message || 'Error al procesar el archivo.' });
+    }
+    next();
+}
+
+app.post('/analyze', (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+        if (err) return multerErrorHandler(err, req, res, next);
+        next();
+    });
+}, async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Archivo no recibido.' });
 
-        // Extraer texto completo del PDF — sin chunking, sin huecos.
-        // Gemini 2.5 Flash tiene ventana de 1M tokens; un manual de 30 páginas
-        // es ~5,000 tokens, completamente dentro del límite.
-        const pdfData    = await pdf(req.file.buffer);
+        // ── Extraer texto del PDF ─────────────────────────────────────────
+        let pdfData;
+        try {
+            pdfData = await pdf(req.file.buffer, { max: 0 });  // max:0 = todas las páginas
+        } catch (pdfErr) {
+            console.error('Error al parsear PDF:', pdfErr.message);
+            return res.status(400).json({ error: 'No se pudo leer el PDF. Verifica que no esté protegido o corrupto.' });
+        }
+
         const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
         const manualText = rawText.substring(0, CONFIG.maxPdfChars);
 
         if (manualText.length < 100) {
-            return res.status(400).json({ error: 'El PDF no contiene texto extraíble.' });
+            return res.status(400).json({ error: 'El PDF no contiene texto extraíble. Puede ser un PDF de imágenes (escaneado).' });
         }
 
-        console.log(`PDF extraído: ${manualText.length} chars — llamando a Gemini (${CONFIG.model})...`);
+        // ── Subir PDF a Gemini File API para archivos grandes ────────────────
+        // La File API acepta hasta 50 MB y permite que Gemini lea el PDF directamente
+        // con OCR nativo — mucho mejor que extraer texto con pdf-parse (que pierde tablas,
+        // imágenes, columnas, etc.). Lo usamos siempre que el archivo > 500 KB.
+        let geminiFileUri = null;
+        const USE_FILE_API = req.file.size > 500 * 1024;  // >500 KB → File API
+
+        if (USE_FILE_API) {
+            try {
+                console.log(`PDF grande (${(req.file.size/1024/1024).toFixed(1)} MB) — subiendo a Gemini File API...`);
+                // Subir usando fetch a la File API de Gemini
+                const uploadRes = await fetch(
+                    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/pdf',
+                            'X-Goog-Upload-Command': 'upload, finalize',
+                            'X-Goog-Upload-Header-Content-Length': req.file.size.toString(),
+                            'X-Goog-Upload-Header-Content-Type': 'application/pdf',
+                        },
+                        body: req.file.buffer,
+                    }
+                );
+                if (uploadRes.ok) {
+                    const fileData = await uploadRes.json();
+                    geminiFileUri = fileData.file?.uri;
+                    console.log(`✓ PDF subido a File API: ${geminiFileUri}`);
+                } else {
+                    const errText = await uploadRes.text();
+                    console.warn(`File API falló (${uploadRes.status}): ${errText} — usando texto extraído`);
+                }
+            } catch (fileApiErr) {
+                console.warn(`File API error: ${fileApiErr.message} — usando texto extraído`);
+            }
+        }
+
+        console.log(`PDF: ${req.file.size} bytes, ${pdfData.numpages} páginas, ${rawText.length} chars extraídos${geminiFileUri ? ' + File API' : ` → usando ${manualText.length} chars`}`);
         const t0 = Date.now();
 
         const model = genAI.getGenerativeModel({
@@ -726,13 +777,22 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             }
         }
 
-        // ── Detectar procesos (multi-diagrama) o usar Gemini directo ─────
+        // ── Llamada a Gemini — con File API o texto plano ────────────────
         async function callGemini(promptText) {
             for (let attempt = 0; attempt < 4; attempt++) {
                 try {
                     console.log(`Llamando a Gemini (intento ${attempt + 1}/4)...`);
-                    const r = await model.generateContent(promptText);
-                    return r.response.text();
+                    let result;
+                    if (geminiFileUri) {
+                        // File API: enviar el PDF como parte del contenido
+                        result = await model.generateContent([
+                            promptText.replace(/\nMANUAL A ANALIZAR:\n[\s\S]*$/, '\nMANUAL A ANALIZAR: [Ver PDF adjunto]'),
+                            { fileData: { mimeType: 'application/pdf', fileUri: geminiFileUri } },
+                        ]);
+                    } else {
+                        result = await model.generateContent(promptText);
+                    }
+                    return result.response.text();
                 } catch(e) {
                     const msg = e.message || '';
                     const retry = (msg.includes('503') || msg.includes('429')) && attempt < 3;
@@ -850,6 +910,80 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
         const stepMap_v = Object.fromEntries(structure.steps.map(s => [s.id, s]));
         const validIds  = new Set(structure.steps.map(s => s.id));
 
+        // FIX 0: AUTO-SPLIT lanes con > 7 nodos LINEALES
+        // Solo divide lanes donde los nodos son genuinamente secuenciales (sin ciclos internos).
+        // Si un lane tiene ciclos (gateway con rama de error hacia atrás), NO lo divide —
+        // dividirlo rompería el ciclo. Solo divide lanes que son puramente lineales.
+        {
+            const MAX_LANE_NODES = 7;
+            const bridgeIds = new Set();
+            let pass = 0, changed = true;
+
+            while (changed && pass < 10) {
+                changed = false; pass++;
+                const newRoles = [], newSteps = [];
+
+                structure.roles.forEach(role => {
+                    const laneSteps = structure.steps.filter(s => s.role === role);
+                    const realCount = laneSteps.filter(s => !bridgeIds.has(s.id)).length;
+
+                    if (realCount <= MAX_LANE_NODES) {
+                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return;
+                    }
+
+                    // Detectar ciclos internos — si hay un backward edge, no dividir
+                    const laneIds = new Set(laneSteps.map(s => s.id));
+                    const laneIdxMap = {};
+                    laneSteps.forEach((s, i) => { laneIdxMap[s.id] = i; });
+                    let hasCycle = false;
+                    laneSteps.forEach(s => {
+                        (s.next || []).forEach(nid => {
+                            if (laneIds.has(nid) && (laneIdxMap[nid] < laneIdxMap[s.id])) {
+                                hasCycle = true;
+                            }
+                        });
+                    });
+
+                    if (hasCycle) {
+                        // No dividir — lane con ciclo (gateway error→retry): dejar como está
+                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return;
+                    }
+
+                    // Lane lineal con >7 nodos: dividir
+                    changed = true;
+                    const base = role.replace(/\s*-\s*Parte\s*[\d\.]+$/i, '').trim();
+                    // Usar el índice global del rol para garantizar nombres únicos
+                    const roleIdx = structure.roles.indexOf(role);
+                    const p1n = `${base} - Parte ${roleIdx}.1`;
+                    const p2n = `${base} - Parte ${roleIdx}.2`;
+                    const p1s = laneSteps.slice(0, MAX_LANE_NODES);
+                    const p2s = laneSteps.slice(MAX_LANE_NODES);
+
+                    const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
+                    const bid = `EvtBr_${safeBase}_${pass}`;
+                    bridgeIds.add(bid);
+
+                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`,
+                        type: 'intermediateEvent', role: p2n, next: [p2s[0].id] };
+
+                    const last = p1s[p1s.length - 1];
+                    if (last.type?.startsWith('endEvent') && !(last.next || []).length) {
+                        last.type = 'intermediateEvent'; last.next = [bid];
+                    } else if (!last.type?.startsWith('endEvent') && !(last.next || []).includes(bid)) {
+                        last.next = [...(last.next || []), bid];
+                    }
+
+                    p1s.forEach(s => { s.role = p1n; }); p2s.forEach(s => { s.role = p2n; });
+                    newRoles.push(p1n, p2n);
+                    p1s.forEach(s => newSteps.push(s)); newSteps.push(bridge); p2s.forEach(s => newSteps.push(s));
+
+                    console.warn(`FIX0: "${role}" (${realCount}) → "${p1n}" (${p1s.length}) + "${p2n}" (${p2s.length})`);
+                });
+
+                if (changed) { structure.roles = newRoles; structure.steps = newSteps; }
+            }
+        }
+
         // FIX 1: endEvent nunca puede tener next[]
         structure.steps.forEach(step => {
             if (step.type?.startsWith('endEvent') && step.next?.length) {
@@ -900,44 +1034,87 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
         });
 
         // FIX 5: nodos huérfanos (sin incoming) en lanes > 0
-        // Solo el startEvent del primer lane puede no tener incoming.
-        // Si un intermediateEvent no tiene incoming → conectarlo desde el hub o lane anterior.
-        // NUNCA convertir endEvent en userTask — eso crea flujos rotos cross-pool.
+        // Regla: el flujo va izquierda→derecha dentro del lane, y SOLO baja
+        // al siguiente lane cuando el proceso continúa ahí.
+        // Si una sección termina → endEvent. Solo conectar hacia abajo si hay continuación.
+        //
+        // CASOS:
+        //   A) Lane tiene orphan intermediateEvent + un endEvent en el mismo lane
+        //      → el endEvent (terminal) se convierte en intermediate y conecta al orphan
+        //      → PATRÓN "Parte X.2": el flujo continúa dentro del mismo lane horizontal
+        //
+        //   B) Orphan es el PRIMER nodo del lane (intermediateEvent de inicio de módulo)
+        //      → intentar conectar desde hub del menú
+        //      → fallback: conectar desde último nodo no-endEvent del lane anterior
+        //
+        //   C) startEvent huérfano en lane > 0 → convertir a intermediateEvent primero
+        //
+        // NUNCA: convertir endEvent → userTask, ni crear conexiones cross-pool.
         {
             const allTargets = new Set(structure.steps.flatMap(s => s.next || []));
-            // Buscar hub de módulos: intermediateEvent con múltiples salidas (menú)
+            // Hub de módulos: nodo con múltiples salidas (típicamente el menú)
             const hub = structure.steps.find(s =>
                 s.type === 'intermediateEvent' && (s.next || []).length > 1
             );
+
             structure.roles.forEach((role, ri) => {
-                if (ri === 0) return; // primer lane: el startEvent no necesita incoming
+                if (ri === 0) return; // primer lane: startEvent no necesita incoming
+
                 const laneSteps = structure.steps.filter(s => s.role === role);
                 if (!laneSteps.length) return;
-                const first = laneSteps[0];
-                if (allTargets.has(first.id)) return; // ya tiene entrada
 
-                // Si el primero es startEvent → convertir a intermediateEvent
-                if (first.type === 'startEvent') {
-                    first.type = 'intermediateEvent';
-                    console.warn(`FIX5: startEvent huérfano "${first.id}" → intermediateEvent`);
-                }
+                // Recalcular allTargets en cada iteración (puede haber cambiado)
+                const currentTargets = new Set(structure.steps.flatMap(s => s.next || []));
 
-                // Intentar conectar desde hub (menú)
-                if (hub && !hub.next.includes(first.id) && first.type === 'intermediateEvent') {
-                    hub.next.push(first.id);
-                    allTargets.add(first.id);
-                    console.warn(`FIX5: hub "${hub.id}" → "${first.id}"`);
-                    return;
-                }
+                // Encuentra todos los huérfanos del lane (no solo el primero)
+                const orphans = laneSteps.filter(s => !currentTargets.has(s.id));
+                if (!orphans.length) return;
 
-                // Fallback: conectar desde último nodo no-end del lane anterior
-                const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
-                const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
-                if (connector && !connector.next.includes(first.id)) {
-                    connector.next.push(first.id);
-                    allTargets.add(first.id);
-                    console.warn(`FIX5: "${connector.id}" → "${first.id}" (lane ${ri-1}→${ri})`);
-                }
+                orphans.forEach(orphan => {
+                    // Ya tiene incoming (puede haber sido conectado en iteración anterior)
+                    const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
+                    if (updatedTargets.has(orphan.id)) return;
+
+                    // Convertir startEvent huérfano a intermediateEvent
+                    if (orphan.type === 'startEvent') {
+                        orphan.type = 'intermediateEvent';
+                        console.warn(`FIX5: startEvent huérfano "${orphan.id}" → intermediateEvent`);
+                    }
+
+                    // CASO A: hay un endEvent en el mismo lane que no tiene salida
+                    // → ese endEvent debe convertirse en intermediate y conectar al orphan
+                    // (patrón "Parte X.2": flujo continúa en el mismo lane)
+                    const samelaneFinalizer = laneSteps.find(s =>
+                        s !== orphan &&
+                        s.type?.startsWith('endEvent') &&
+                        !(s.next || []).length &&
+                        !updatedTargets.has(orphan.id)
+                    );
+                    if (samelaneFinalizer && orphan.type === 'intermediateEvent') {
+                        samelaneFinalizer.type = 'intermediateEvent';
+                        samelaneFinalizer.next = [orphan.id];
+                        console.warn(`FIX5A: "${samelaneFinalizer.id}" endEvent→intermediate, → "${orphan.id}" (Parte X.2)`);
+                        return;
+                    }
+
+                    // CASO B: orphan es intermediateEvent de inicio de módulo
+                    // → conectar desde hub (menú)
+                    if (hub && !hub.next.includes(orphan.id) && orphan.type === 'intermediateEvent') {
+                        hub.next.push(orphan.id);
+                        console.warn(`FIX5B: hub "${hub.id}" → "${orphan.id}"`);
+                        return;
+                    }
+
+                    // CASO C: fallback — conectar desde el último nodo no-endEvent del lane anterior
+                    if (ri > 0) {
+                        const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
+                        const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
+                        if (connector && !connector.next.includes(orphan.id)) {
+                            connector.next.push(orphan.id);
+                            console.warn(`FIX5C: "${connector.id}" → "${orphan.id}" (lane ${ri-1}→${ri})`);
+                        }
+                    }
+                });
             });
         }
 
@@ -968,6 +1145,79 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             [/^tocar?\s+/i,'Seleccionar '],[/clic/gi,''],[/botón/gi,'opción'],[/boton/gi,'opción'],
         ];
 
+        // FIX 8: Evt_Volver* huérfanos — conectar desde endEvent del mismo lane.
+        {
+            const allTargets8 = new Set(structure.steps.flatMap(s => s.next || []));
+            structure.steps.forEach(volver => {
+                if (!volver.id.toLowerCase().includes('volver')) return;
+                if (allTargets8.has(volver.id)) return;
+                const sameEnd = structure.steps.find(s =>
+                    s.role === volver.role && s.type?.startsWith('endEvent')
+                );
+                if (sameEnd) {
+                    console.warn(`FIX8: "${sameEnd.id}" → intermediateEvent → "${volver.id}"`);
+                    sameEnd.type = 'intermediateEvent';
+                    sameEnd.next = [volver.id];
+                    allTargets8.add(volver.id);
+                }
+            });
+        }
+
+        // FIX 9: garantizar startEvent en CADA pool / proceso.
+        // Gemini frecuentemente genera el inicio de Brigadista (o cualquier segundo pool)
+        // como intermediateCatchEvent. Este fix actúa por pool:
+        //   – Detecta si hay startEvent en la primera lane del pool
+        //   – Si no: convierte el primer nodo (sin incoming) a startEvent
+        //   – Elimina cualquier incoming cross-pool hacia ese nodo
+        {
+            // Detectar pools: grupos de roles antes/después del splitIdx
+            // Para ser agnóstico del split, trabajamos sobre todos los roles agrupados
+            // por el prefijo "Ciudadano" / "Brigadista" — o simplemente el primer nodo
+            // sin incoming de CADA lane-0.
+            //
+            // Estrategia: para cada rol que es el primero de su "grupo" (rol index 0
+            // o primer rol después de splitIdx), asegurar que su primer nodo sea startEvent.
+
+            const poolBoundaries = [0];  // índices en allRoles donde empieza cada pool
+            // Detectar el splitIdx de forma anticipada (antes del split real más abajo)
+            for (let i = 1; i < structure.roles.length; i++) {
+                const hasBrig = structure.roles[i].toLowerCase().includes('brigadista');
+                const prevCiu = !structure.roles[i-1].toLowerCase().includes('brigadista');
+                if (hasBrig && prevCiu) { poolBoundaries.push(i); break; }
+            }
+
+            poolBoundaries.forEach(boundary => {
+                const firstRole = structure.roles[boundary];
+                if (!firstRole) return;
+                const poolRoles = structure.roles.slice(boundary,
+                    poolBoundaries[poolBoundaries.indexOf(boundary)+1] ?? structure.roles.length);
+                const poolSteps = structure.steps.filter(s => poolRoles.includes(s.role));
+                const hasStart  = poolSteps.some(s => s.type === 'startEvent');
+
+                if (!hasStart) {
+                    // Encontrar el primer nodo del pool que no tiene incoming DENTRO del pool
+                    const poolIds  = new Set(poolSteps.map(s => s.id));
+                    const targets  = new Set(poolSteps.flatMap(s => s.next || []).filter(id => poolIds.has(id)));
+                    const orphan   = poolSteps.find(s => !targets.has(s.id));
+                    const firstNode = orphan || poolSteps[0];
+
+                    if (firstNode && firstNode.type !== 'startEvent') {
+                        console.warn(`FIX9: "${firstNode.id}" (${firstNode.type}) → startEvent (pool boundary ${boundary})`);
+                        firstNode.type = 'startEvent';
+                        // Eliminar incoming cross-pool hacia este nodo
+                        structure.steps.forEach(s => {
+                            if (!poolRoles.includes(s.role) && (s.next || []).includes(firstNode.id)) {
+                                s.next = s.next.filter(n => n !== firstNode.id);
+                                console.warn(`FIX9: cross-pool eliminado: "${s.id}" → "${firstNode.id}"`);
+                            }
+                        });
+                        // Si era intermediateEvent/intermediateCatchEvent, limpiar incoming dentro del pool también
+                        // (el startEvent no debe tener incoming)
+                    }
+                }
+            });
+        }
+
         // ── Split roles into two pools: Ciudadano and Brigadista ──────────────
         // Detect the split point: first lane with "brigadista" that follows
         // one or more "ciudadano" lanes. Each pool gets its own process and DI.
@@ -990,10 +1240,7 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
         console.log('⚙️  Generando XML...');
 
         if (splitIdx > 0) {
-            // Two-pool mode — UN solo archivo, dos pools apilados verticalmente.
-            // Pool 1 (Ciudadano) arriba en y=60.
-            // Pool 2 (Brigadista) debajo del Pool 1 con 60px de separación.
-            // Ambos dentro de UNA collaboration y UN BPMNDiagram → un solo canvas limpio.
+            // Dos pools: Ciudadano arriba, Brigadista abajo — UN solo archivo BPMN.
             const roles1  = allRoles.slice(0, splitIdx);
             const roles2  = allRoles.slice(splitIdx);
             const steps1  = allSteps.filter(s => roles1.includes(s.role));
@@ -1001,8 +1248,8 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             const struct1 = { roles: roles1, steps: steps1 };
             const struct2 = { roles: roles2, steps: steps2 };
 
-            const cleanPoolName1 = roles1.some(r => r.toLowerCase().includes('ciudadano'))   ? 'Portal Ciudadano'        : 'Proceso Ciudadano';
-            const cleanPoolName2 = roles2.some(r => r.toLowerCase().includes('brigadista'))  ? 'Herramienta Brigadista'  : 'Proceso Brigadista';
+            const cleanPoolName1 = roles1.some(r => r.toLowerCase().includes('ciudadano'))  ? 'Portal Ciudadano'       : 'Proceso Ciudadano';
+            const cleanPoolName2 = roles2.some(r => r.toLowerCase().includes('brigadista')) ? 'Herramienta Brigadista' : 'Proceso Brigadista';
 
             try {
                 logicXml = generateLogic(struct1, processId, '') + '\n' + generateLogic(struct2, processId2, 'B');
@@ -1012,7 +1259,6 @@ app.post('/analyze', upload.single('file'), async (req, res) => {
             try {
                 di1 = generateDI(struct1, processId,  { poolY: 60,                  poolId: 'Participant_1', poolName: cleanPoolName1 });
                 di2 = generateDI(struct2, processId2, { poolY: 60 + di1.poolH + 60, poolId: 'Participant_2', poolName: cleanPoolName2 });
-                // Un solo BPMNDiagram con ambos pools apilados — uno arriba, otro abajo
                 diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
     <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
 ${di1.shapesXml}${di2.shapesXml}${di1.edgesXml}${di2.edgesXml}    </bpmndi:BPMNPlane>
@@ -1023,8 +1269,11 @@ ${di1.shapesXml}${di2.shapesXml}${di1.edgesXml}${di2.edgesXml}    </bpmndi:BPMNP
     <participant id="Participant_1" name="${xmlEscape(cleanPoolName1)}" processRef="${processId}"/>
     <participant id="Participant_2" name="${xmlEscape(cleanPoolName2)}" processRef="${processId2}"/>
   </collaboration>`;
+
+            console.log(`✓ Pool 1: "${cleanPoolName1}" — ${steps1.length} pasos`);
+            console.log(`✓ Pool 2: "${cleanPoolName2}" — ${steps2.length} pasos`);
         } else {
-            // Single pool fallback
+            // Pool único
             try { logicXml = generateLogic(structure, processId); }
             catch (e) { throw new Error(`Error en generateLogic: ${e.message}`); }
             try {
@@ -1056,59 +1305,12 @@ ${logicXml}
 ${diXml}
 </definitions>`;
 
-        // ── Procesar diagramas adicionales si hay multi-proceso ──────────
-        const bpmns = [{ name: allRawJsons[0]?.name || 'Proceso Principal', bpmn: finalXml }];
-
-        for (let i = 1; i < allRawJsons.length; i++) {
-            const { rawJson: rj, name } = allRawJsons[i];
-            try {
-                let js = rj.replace(/```json|```/g,'').trim()
-                           .replace(/\/\/[^\n\r"]*/g,'')
-                           .replace(/\/\*[\s\S]*?\*\//g,'')
-                           .replace(/,\s*([}\]])/g,'$1');
-                if (!js.trimEnd().endsWith('}')) {
-                    const lb = js.lastIndexOf('}');
-                    if (lb > 0) js = js.substring(0, lb+1) + '\n  ]\n}';
-                }
-                const struct = JSON.parse(js);
-                if (!struct.roles?.length || !struct.steps?.length) throw new Error('sin roles/pasos');
-
-                const pid = `Process_${Date.now()}_${i}`;
-                const di  = generateDI(struct, pid, { poolY: 60, poolId: `Participant_${i+1}`, poolName: name });
-                const xml = `<?xml version="1.0" encoding="utf-8"?>
-<definitions
-  xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
-  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
-  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
-  xsi:schemaLocation="http://www.omg.org/spec/BPMN/20100524/MODEL http://www.omg.org/spec/BPMN/20100524/MODEL/BPMN20.xsd"
-  id="Definitions_${i+1}"
-  targetNamespace="http://www.bizagi.com/definitions/20250226143500"
-  exporter="Bizagi Modeler"
-  exporterVersion="3.4.0.013">
-  <collaboration id="Collaboration_${i+1}">
-    <participant id="Participant_${i+1}" name="${xmlEscape(name)}" processRef="${pid}"/>
-  </collaboration>
-${generateLogic(struct, pid)}
-  <bpmndi:BPMNDiagram id="BPMNDiagram_${i+1}" name="${xmlEscape(name)}">
-    <bpmndi:BPMNPlane id="BPMNDiagram_${i+1}_Plane" bpmnElement="Collaboration_${i+1}">
-${di.shapesXml}${di.edgesXml}    </bpmndi:BPMNPlane>
-  </bpmndi:BPMNDiagram>
-</definitions>`;
-                bpmns.push({ name, bpmn: xml });
-                console.log(`✓ BPMN adicional: "${name}" — ${struct.steps.length} pasos`);
-            } catch(e) {
-                console.warn(`WARN: diagrama extra "${name}" falló: ${e.message}`);
-            }
-        }
-
-        console.log(`✓ Total BPMNs generados: ${bpmns.length} — ${structure.steps.length} pasos en el principal`);
+        console.log(`✓ BPMN generado — ${allSteps.length} pasos, ${allRoles.length} roles`);
         res.json({
             success: true,
             data:    mdMatch ? mdMatch[1].trim() : 'Análisis completado.',
-            bpmn:    bpmns[0].bpmn,   // compatibilidad frontend existente
-            bpmns,                     // array completo [{name, bpmn}]
+            bpmn:    finalXml,
+            bpmns:   [{ name: 'Proceso de Negocio', bpmn: finalXml }],
         });
 
     } catch (error) {
@@ -1131,16 +1333,27 @@ server.keepAliveTimeout = CONFIG.timeout;
 // describiendo qué sistemas detectó y qué estructura generaría,
 // sin construir ningún XML. Útil para verificar el output de Gemini.
 // ============================================================
-app.post('/debug', upload.single('file'), async (req, res) => {
+app.post('/debug', (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+        if (err) return multerErrorHandler(err, req, res, next);
+        next();
+    });
+}, async (req, res) => {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
     try {
         if (!req.file) return res.status(400).send('ERROR: Archivo no recibido.');
 
-        const pdfData    = await pdf(req.file.buffer);
+        let pdfData;
+        try {
+            pdfData = await pdf(req.file.buffer, { max: 0 });
+        } catch (pdfErr) {
+            return res.status(400).send(`ERROR: No se pudo leer el PDF — ${pdfErr.message}`);
+        }
+
         const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
         const manualText = rawText.substring(0, CONFIG.maxPdfChars);
-        if (manualText.length < 100) return res.status(400).send('ERROR: PDF sin texto extraíble.');
+        if (manualText.length < 100) return res.status(400).send('ERROR: PDF sin texto extraíble (posiblemente escaneado).');
 
         const lines = [];
         const log = (...args) => { const msg = args.join(' '); console.log(msg); lines.push(msg); };
