@@ -5,7 +5,6 @@ const pdf     = require('pdf-parse');
 const cors    = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// OpenClaw y detección de procesos (opcionales — si no existen, se omiten sin error)
 let analyzeManual = null;
 let detectBusinessProcesses = null;
 try { ({ analyzeManual } = require('./openclaw/client')); } catch(_) {}
@@ -17,7 +16,7 @@ app.use(express.json({ limit: '150mb' }));
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 },  // 50 MB máximo
+    limits: { fileSize: 50 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')) {
             cb(null, true);
@@ -26,19 +25,16 @@ const upload = multer({
         }
     },
 });
-const genAI  = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CONFIG = {
     model:       'gemini-2.5-flash',
-    maxPdfChars: 120_000,   // subido de 50k — manuales grandes necesitan más contexto
+    maxPdfChars: 120_000,
     maxTokens:   65_536,
     temperature: 0,
-    timeout:     180_000,   // 3 min para PDFs grandes
+    timeout:     180_000,
 };
 
-// ============================================================
-// UTILIDAD: Escapar caracteres especiales XML
-// ============================================================
 function xmlEscape(str) {
     return (str || '')
         .replace(/&/g,  '&amp;')
@@ -48,167 +44,105 @@ function xmlEscape(str) {
         .replace(/'/g,  '&apos;');
 }
 
-// ============================================================
-// 1. ASIGNACIÓN DE COLUMNAS — orden topológico seguro
-//    Usa Kahn's algorithm (BFS sin ciclos).
-//    Si hay ciclos, los nodos restantes se asignan al final.
-// ============================================================
 function assignColumns(steps) {
-    const stepMap    = {};
-    const nodeColumn = {};
+    const stepMap = {}, nodeColumn = {};
     steps.forEach(s => { stepMap[s.id] = s; });
-
-    // Calcular in-degree de cada nodo
     const inDegree = {};
     steps.forEach(s => { inDegree[s.id] = 0; });
-    steps.forEach(s => {
-        (s.next || []).forEach(nextId => {
-            if (inDegree[nextId] !== undefined) inDegree[nextId]++;
-        });
-    });
-
-    // Iniciar con nodos sin incoming (in-degree 0)
+    steps.forEach(s => { (s.next || []).forEach(nid => { if (inDegree[nid] !== undefined) inDegree[nid]++; }); });
     const queue = steps.filter(s => inDegree[s.id] === 0).map(s => s.id);
     if (queue.length === 0 && steps.length > 0) queue.push(steps[0].id);
-
-    // Procesar en orden topológico — cada nodo se visita UNA sola vez
     const processed = new Set();
-    steps.forEach(s => { nodeColumn[s.id] = 0; }); // inicializar a 0
-
+    steps.forEach(s => { nodeColumn[s.id] = 0; });
     while (queue.length > 0) {
         const id = queue.shift();
         if (processed.has(id)) continue;
         processed.add(id);
-
         const step = stepMap[id];
         if (step && step.next) {
             step.next.forEach(nextId => {
                 if (!nextId || nextId === id) return;
-                // La columna del siguiente es máximo entre su actual y col+1
                 const newCol = (nodeColumn[id] || 0) + 1;
-                if (newCol > (nodeColumn[nextId] || 0)) {
-                    nodeColumn[nextId] = newCol;
-                }
-                // Solo encolar si no fue procesado (evita ciclos)
-                if (!processed.has(nextId)) {
-                    queue.push(nextId);
-                }
+                if (newCol > (nodeColumn[nextId] || 0)) nodeColumn[nextId] = newCol;
+                if (!processed.has(nextId)) queue.push(nextId);
             });
         }
     }
-
     return nodeColumn;
 }
 
-// ============================================================
-// 2. ASIGNACIÓN DE FILAS dentro de cada lane
-//    Nodos en la misma columna y mismo lane se apilan
-//    verticalmente para evitar solapamientos.
-// ============================================================
 function assignRows(steps, nodeColumn, roles) {
-    // Por cada (lane, columna) contar cuántos nodos hay
-    const laneColCount = {}; // "roleIndex_col" -> nextRow
-    const nodeRow = {};
-
-    // Ordenar steps por columna para asignación consistente
-    const sorted = [...steps].sort((a, b) =>
-        (nodeColumn[a.id] || 0) - (nodeColumn[b.id] || 0)
-    );
-
+    const laneColCount = {}, nodeRow = {};
+    const sorted = [...steps].sort((a, b) => (nodeColumn[a.id] || 0) - (nodeColumn[b.id] || 0));
     sorted.forEach(step => {
         const roleIdx = roles.indexOf(step.role);
-        const col     = nodeColumn[step.id] || 0;
-        const key     = `${roleIdx}_${col}`;
+        const col = nodeColumn[step.id] || 0;
+        const key = `${roleIdx}_${col}`;
         if (laneColCount[key] === undefined) laneColCount[key] = 0;
         nodeRow[step.id] = laneColCount[key];
         laneColCount[key]++;
     });
-
-    // Calcular altura máxima de filas por lane
     const maxRowPerLane = {};
     roles.forEach((_, i) => { maxRowPerLane[i] = 0; });
     steps.forEach(step => {
         const roleIdx = roles.indexOf(step.role);
-        const row     = nodeRow[step.id] || 0;
+        const row = nodeRow[step.id] || 0;
         if (row + 1 > maxRowPerLane[roleIdx]) maxRowPerLane[roleIdx] = row + 1;
     });
-
     return { nodeRow, maxRowPerLane };
 }
 
-// ============================================================
-// 3. GENERADOR DE LÓGICA BPMN (XML semántico)
-//    Soporta: startEvent, endEvent, endEventMessage,
-//             userTask, serviceTask, scriptTask,
-//             exclusiveGateway,
-//             intermediateEvent, intermediateEventMessage
-// ============================================================
 function generateLogic(structure, processId, lanePrefix = '') {
     const { roles, steps } = structure;
 
+    // Cada pool recibe un prefijo único para sus IDs de nodos y flows.
+    // Esto evita colisiones cuando múltiples pools comparten IDs como "Start_Login".
+    const pfx = lanePrefix === '' ? 'p0_' : `p${lanePrefix}_`;
+    const pid  = id => `${pfx}${id}`;
+    const fid  = (s, t) => `Flow_${pfx}${s}_${pfx}${t}`;
+
     const lanes = roles.map((role, idx) => {
         const laneId = `Lane_${lanePrefix}${idx}`;
-        const refs = steps
-            .filter(s => s.role === role)
-            .map(s => `        <flowNodeRef>${s.id}</flowNodeRef>`)
-            .join('\n');
+        const refs = steps.filter(s => s.role === role)
+            .map(s => `        <flowNodeRef>${pid(s.id)}</flowNodeRef>`).join('\n');
         return `      <lane id="${laneId}" name="${xmlEscape(role)}">\n${refs}\n      </lane>`;
     }).join('\n');
 
     const elements = steps.map(step => {
-        const outgoing = (step.next || [])
-            .map(t => `      <outgoing>Flow_${step.id}_${t}</outgoing>`)
-            .join('\n');
-        const incoming = steps
-            .filter(s => (s.next || []).includes(step.id))
-            .map(s => `      <incoming>Flow_${s.id}_${step.id}</incoming>`)
-            .join('\n');
-
+        const sid      = pid(step.id);
+        const outgoing = (step.next || []).map(t => `      <outgoing>${fid(step.id, t)}</outgoing>`).join('\n');
+        const incoming = steps.filter(s => (s.next || []).includes(step.id))
+            .map(s => `      <incoming>${fid(s.id, step.id)}</incoming>`).join('\n');
         let xml = '';
         switch (step.type) {
             case 'startEvent':
-                xml = `    <startEvent id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </startEvent>`;
-                break;
+                xml = `    <startEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </startEvent>`; break;
             case 'endEvent':
-                xml = `    <endEvent id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </endEvent>`;
-                break;
-            // EndEvent con señal de mensaje (sobre relleno) — para confirmar operaciones
+                xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </endEvent>`; break;
             case 'endEventMessage':
-                xml = `    <endEvent id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </endEvent>`;
-                break;
+                xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </endEvent>`; break;
             case 'exclusiveGateway':
-                xml = `    <exclusiveGateway id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </exclusiveGateway>`;
-                break;
+                xml = `    <exclusiveGateway id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </exclusiveGateway>`; break;
             case 'userTask':
-                xml = `    <userTask id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </userTask>`;
-                break;
+                xml = `    <userTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </userTask>`; break;
             case 'serviceTask':
-                xml = `    <serviceTask id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`;
-                break;
-            // Tarea de sistema/script (engranaje) — para validaciones y guardados
+                xml = `    <serviceTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`; break;
             case 'scriptTask':
-                xml = `    <scriptTask id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </scriptTask>`;
-                break;
-            // Evento intermedio simple (círculo doble) — para marcar inicio de sub-sección/módulo
+                xml = `    <scriptTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </scriptTask>`; break;
             case 'intermediateEvent':
-                xml = `    <intermediateCatchEvent id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`;
-                break;
-            // Evento intermedio con mensaje — para notificaciones dentro del proceso
+                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`; break;
             case 'intermediateEventMessage':
-                xml = `    <intermediateThrowEvent id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`;
-                break;
+                xml = `    <intermediateThrowEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`; break;
             default:
-                xml = `    <task id="${step.id}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </task>`;
+                xml = `    <task id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </task>`;
         }
         return xml;
     }).join('\n');
 
     const sequences = steps.flatMap(step =>
         (step.next || []).map(targetId => {
-            const condAttr = step.conditions?.[targetId]
-                ? ` name="${xmlEscape(step.conditions[targetId])}"`
-                : '';
-            return `    <sequenceFlow id="Flow_${step.id}_${targetId}" sourceRef="${step.id}" targetRef="${targetId}"${condAttr}/>`;
+            const condAttr = step.conditions?.[targetId] ? ` name="${xmlEscape(step.conditions[targetId])}"` : '';
+            return `    <sequenceFlow id="${fid(step.id, targetId)}" sourceRef="${pid(step.id)}" targetRef="${pid(targetId)}"${condAttr}/>`;
         })
     ).join('\n');
 
@@ -221,35 +155,17 @@ ${sequences}
   </process>`;
 }
 
-// ============================================================
-// 4. GENERADOR DE LAYOUT (BPMN DI) — estilo Bizagi profesional
-//
-//  ESTRATEGIA DE ROUTING ANTI-SOLAPAMIENTO:
-//  ─────────────────────────────────────────
-//  Nodos: lane height fija 360 px, centrados verticalmente.
-//  Tasks 120×80 | Events 36×36 | Gateways 50×50 | COL_W 260 px
-//
-//  Same-lane:
-//    • Forward: línea recta R(src)→L(tgt) a la misma Y central
-//    • Backward: arco limpio por encima del lane (arcY único por src)
-//    • Wrap (2ª fila): sale derecha → baja → vuelve a col 0
-//
-//  Cross-lane — highway DERECHO escalonado:
-//    • CADA arista tiene su propia pista vertical (hwX único)
-//    • Sale por R(src)+margen_col → baja/sube dentro del lane actual
-//      hasta un slot Y en el borde del lane (staggered por col fuente)
-//    • Viaja horizontalmente hasta hwX
-//    • Viaja verticalmente hasta el borde del lane destino
-//    • Entra por L(tgt) horizontalmente
-//    • Esto garantiza que NINGUNA línea comparte coordenadas con otra
-// ============================================================
+
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
-    const POOL_ID   = poolOpts.poolId   ?? 'Participant_1';
-    const POOL_Y    = poolOpts.poolY    ?? 60;
-    const LANE_PFX  = POOL_ID === 'Participant_1' ? '' : 'B';
+    const POOL_ID   = poolOpts.poolId    ?? 'Participant_1';
+    const POOL_Y    = poolOpts.poolY     ?? 60;
+    const LANE_PFX  = poolOpts.lanePrefix ?? '';
+    // ID prefix must match generateLogic — same formula
+    const NODE_PFX  = LANE_PFX === '' ? 'p0_' : `p${LANE_PFX}_`;
+    const npid      = id => `${NODE_PFX}${id}`;
+    const nfid      = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
 
-    // ── Node dimensions ───────────────────────────────────────
     const NODE_SIZE = {
         startEvent:               { w: 36,  h: 36 },
         endEvent:                 { w: 36,  h: 36 },
@@ -265,25 +181,23 @@ function generateDI(structure, processId, poolOpts = {}) {
     };
     const sz = type => NODE_SIZE[type] || NODE_SIZE.task;
 
-    // ── Layout constants (calibrated vs. professional Bizagi reference) ──────
-    // Professional reference: lane h≈350, tasks w=90-120 h=60, events w/h=30
-    // Column gap ≈ 190px center-to-center, first node cx≈310 from pool left
-    const POOL_X      = 160;              // pool label block
-    const LABEL_W     = 30;              // pool label width
-    const LANE_X      = POOL_X + LABEL_W; // 190 — lane left edge
-    const LANE_H      = 350;              // lane height, single row
-    const LANE_H_2    = 700;              // lane height, two rows
-    const COL_W       = 190;              // center-to-center column spacing
-    const MAX_COLS    = 7;                // 7 nodes fit in one row (310 + 6*190 = 1450)
-    const COL0_CX     = LANE_X + 120;    // center-x of column 0 = 310
-
-    // Highway: cross-lane edges route right of all nodes, one track per edge
-    const HW_STEP     = 20;
+    // ── Layout constants ─────────────────────────────────────────────────────
+    // COL_W 320: gap visible entre tareas = 320-120 = 200px — espacioso y profesional
+    // LANE_H 420: altura cómoda, nodos centrados con buen margen vertical
+    const POOL_X   = 160;
+    const LABEL_W  = 30;
+    const LANE_X   = POOL_X + LABEL_W;      // 190
+    const LANE_H   = 420;                   // altura lane fila simple
+    const LANE_H_2 = 840;                   // altura lane doble fila
+    const COL_W    = 320;                   // centro a centro — gap visual = 320-120 = 200px
+    const MAX_COLS = 7;
+    const COL0_CX  = LANE_X + 160;         // cx columna 0
+    const HW_STEP  = 25;
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // ── 1. Topological sort per lane ─────────────────────────
+    // Topological sort per lane
     const laneOrder = {};
     roles.forEach(role => {
         const members = new Set(steps.filter(s => s.role === role).map(s => s.id));
@@ -309,7 +223,7 @@ function generateDI(structure, processId, poolOpts = {}) {
         laneOrder[role] = order;
     });
 
-    // ── 2. Assign col/row ────────────────────────────────────
+    // Assign col/row
     const nodeCol = {}, nodeRow = {}, laneRows = {};
     roles.forEach(role => {
         const order = laneOrder[role] || [];
@@ -322,7 +236,7 @@ function generateDI(structure, processId, poolOpts = {}) {
         laneRows[role] = maxRow + 1;
     });
 
-    // ── 3. Lane heights & Y positions ────────────────────────
+    // Lane heights & Y positions
     const laneH = {}, laneY = {};
     let curY = POOL_Y;
     roles.forEach((role, ri) => {
@@ -332,7 +246,7 @@ function generateDI(structure, processId, poolOpts = {}) {
     });
     const poolH = curY - POOL_Y;
 
-    // ── 4. Node pixel positions ───────────────────────────────
+    // Node pixel positions
     const pos = {};
     steps.forEach(s => {
         const { w, h } = sz(s.type);
@@ -343,26 +257,19 @@ function generateDI(structure, processId, poolOpts = {}) {
         const cy  = laneY[ri] + row * LANE_H + LANE_H / 2;
         pos[s.id] = {
             x: Math.round(cx - w / 2), y: Math.round(cy - h / 2),
-            w, h,
-            cx: Math.round(cx), cy: Math.round(cy),
+            w, h, cx: Math.round(cx), cy: Math.round(cy),
         };
     });
 
-    // ── 5. Pool width ─────────────────────────────────────────
+    // Pool width
     const maxNodeRight = steps.reduce((m, s) => {
         const p = pos[s.id]; return p ? Math.max(m, p.x + p.w) : m;
     }, COL0_CX + (MAX_COLS - 1) * COL_W + 60);
-
-    // highway starts 60 px after last node
     const HW_BASE = maxNodeRight + 60;
 
-    // ── 6. Assign highway tracks to cross-lane edges ─────────
-    // Sort so that longer-spanning edges get outer (larger hwX) tracks
-    // This keeps shorter connections close to the pool content,
-    // longer ones further right — mirrors professional Bizagi output.
-    const hwMap  = new Map();   // "src→tgt" → { hwX, exitSlotY, enterSlotY }
-    let   hwIdx  = 0;
-
+    // Highway tracks
+    const hwMap = new Map();
+    let hwIdx = 0;
     {
         const cross = [];
         steps.forEach(s => {
@@ -371,45 +278,26 @@ function generateDI(structure, processId, poolOpts = {}) {
                 const t = stepMap[tid];
                 if (!t) return;
                 const ti = roles.indexOf(t.role);
-                if (ti !== si) {
-                    cross.push({
-                        src: s.id, tgt: tid, si, ti,
-                        gap: Math.abs(ti - si),
-                        col: nodeCol[s.id] ?? 0,
-                    });
-                }
+                if (ti !== si) cross.push({ src: s.id, tgt: tid, si, ti, gap: Math.abs(ti - si), col: nodeCol[s.id] ?? 0 });
             });
         });
-        // Longer gap → outer track; ties broken by source lane then column
-        cross.sort((a, b) =>
-            b.gap - a.gap ||
-            a.si  - b.si  ||
-            a.col - b.col
-        );
+        cross.sort((a, b) => b.gap - a.gap || a.si - b.si || a.col - b.col);
         cross.forEach(e => {
             const key = `${e.src}->${e.tgt}`;
-            if (!hwMap.has(key)) {
-                hwMap.set(key, HW_BASE + hwIdx * HW_STEP);
-                hwIdx++;
-            }
+            if (!hwMap.has(key)) { hwMap.set(key, HW_BASE + hwIdx * HW_STEP); hwIdx++; }
         });
     }
 
-    const poolW = Math.max(
-        1760,
-        HW_BASE + hwIdx * HW_STEP + 80
-    );
+    const poolW = Math.max(2000, HW_BASE + hwIdx * HW_STEP + 80);
 
-    // ── Helpers ───────────────────────────────────────────────
     const P   = id => pos[id];
     const R   = id => P(id).x + P(id).w;
     const L   = id => P(id).x;
     const CX  = id => P(id).cx;
     const CY  = id => P(id).cy;
-    const wpt = pts => pts.map(([x, y]) =>
-        `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`).join('\n');
+    const wpt = pts => pts.map(([x, y]) => `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`).join('\n');
 
-    // ── 7. Shapes ─────────────────────────────────────────────
+    // Shapes
     let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
@@ -423,46 +311,42 @@ function generateDI(structure, processId, poolOpts = {}) {
     steps.forEach(s => {
         const p = P(s.id);
         if (!p) return;
-        shapes += `      <bpmndi:BPMNShape id="Shape_${s.id}" bpmnElement="${s.id}">
+        shapes += `      <bpmndi:BPMNShape id="Shape_${npid(s.id)}" bpmnElement="${npid(s.id)}">
         <dc:Bounds x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}"/>
       </bpmndi:BPMNShape>\n`;
     });
 
-    // ── 8. Edges ──────────────────────────────────────────────
+    // Edges
     let edges = '';
-
     steps.forEach(step => {
         if (!P(step.id)) return;
         const srcRi = roles.indexOf(step.role);
-
         (step.next || []).forEach(targetId => {
             if (!P(targetId)) return;
             const tgtRi  = roles.indexOf(stepMap[targetId]?.role);
-            const edgeId = `Edge_${step.id}_${targetId}`;
-            const flowId = `Flow_${step.id}_${targetId}`;
+            const edgeId = `Edge_${npid(step.id)}_${npid(targetId)}`;
+            const flowId = nfid(step.id, targetId);
             let pts;
 
             if (srcRi === tgtRi) {
-                // ── Same-lane routing ──────────────────────────
+                // ── Same lane ─────────────────────────────────
                 const srcRow = nodeRow[step.id] ?? 0;
                 const tgtRow = nodeRow[targetId] ?? 0;
-
                 if (srcRow < tgtRow) {
-                    // Wrap: exit right → wrapX → down past divider → returnX → enter col0 row1
-                    // Stagger per lane index to avoid overlap between different lane wraps
+                    // Wrap to next row inside same lane
                     const wrapX   = HW_BASE - 40 + srcRi * 4;
                     const returnX = LANE_X + 10 + srcRi * 4;
                     const midY    = laneY[srcRi] + (srcRow + 1) * LANE_H - 15;
                     pts = [
-                        [R(step.id),   CY(step.id)],
-                        [wrapX,        CY(step.id)],
-                        [wrapX,        midY],
-                        [returnX,      midY],
-                        [returnX,      CY(targetId)],
-                        [L(targetId),  CY(targetId)],
+                        [R(step.id),  CY(step.id)],
+                        [wrapX,       CY(step.id)],
+                        [wrapX,       midY],
+                        [returnX,     midY],
+                        [returnX,     CY(targetId)],
+                        [L(targetId), CY(targetId)],
                     ];
                 } else if (CX(targetId) <= CX(step.id)) {
-                    // Backward: arc above lane top padding
+                    // Backward arc — above lane top
                     const arcY = laneY[srcRi] + 14;
                     pts = [
                         [R(step.id),       CY(step.id)],
@@ -473,24 +357,44 @@ function generateDI(structure, processId, poolOpts = {}) {
                         [L(targetId),      CY(targetId)],
                     ];
                 } else {
-                    // Simple forward straight line
+                    // Simple forward
                     pts = [[R(step.id), CY(step.id)], [L(targetId), CY(targetId)]];
                 }
-
             } else {
-                // ── Cross-lane highway routing ─────────────────
-                // Each edge has its own hwX track → no shared verticals
-                const key = `${step.id}->${targetId}`;
-                const hwX = hwMap.get(key) ?? HW_BASE;
-                pts = [
-                    [R(step.id),  CY(step.id)],
-                    [hwX,         CY(step.id)],
-                    [hwX,         CY(targetId)],
-                    [L(targetId), CY(targetId)],
-                ];
+                // ── Cross-lane routing ─────────────────────────
+                // Estilo Bizagi profesional (igual al diagrama de referencia salud.bpmn):
+                //   Cada flecha usa un X ligeramente distinto para no apilarse.
+                //   Sale por la parte inferior del nodo fuente, baja hasta el espacio
+                //   entre lanes, gira horizontal al X del destino, entra por arriba.
+                //   Funciona tanto hacia adelante como hacia atrás.
+                const outIdx   = (step.next || []).indexOf(targetId);
+                const outCount = (step.next || []).length;
+                const spread   = Math.min(outCount - 1, 6) * 18;
+                const offset   = outCount > 1
+                    ? -spread / 2 + outIdx * (spread / Math.max(outCount - 1, 1))
+                    : 0;
+
+                const srcCX     = CX(step.id) + offset;
+                const tgtCX     = CX(targetId);
+                const srcBottom = P(step.id).y + P(step.id).h;
+                const tgtTop    = P(targetId).y;
+
+                if (Math.abs(srcCX - tgtCX) < 5) {
+                    pts = [
+                        [srcCX, srcBottom],
+                        [srcCX, tgtTop],
+                    ];
+                } else {
+                    const midY = (laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2;
+                    pts = [
+                        [srcCX, srcBottom],
+                        [srcCX, midY],
+                        [tgtCX, midY],
+                        [tgtCX, tgtTop],
+                    ];
+                }
             }
 
-            // ── Condition label ───────────────────────────────
             const condText = step.conditions?.[targetId];
             let labelXml = '';
             if (condText) {
@@ -509,167 +413,256 @@ ${wpt(pts)}
     return { poolH, shapesXml: shapes, edgesXml: edges };
 }
 
-
-// ============================================================
-// 5. PROMPT — pide JSON compacto, máx 50 pasos
-// ============================================================
 function buildPrompt(text) {
-    return `Eres un analista de procesos BPMN experto. Analiza el manual y genera un diagrama BPMN en estilo Bizagi.
-
-TU TAREA: leer el manual COMPLETO y modelar TODOS los procesos descritos, sin omitir ninguna sección.
+    return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
 
 ═══════════════════════════════════════════════════════════
-PASO 1 — ANTES DE GENERAR EL JSON: IDENTIFICA EXHAUSTIVAMENTE
+FILOSOFÍA: MENOS ES MÁS
 ═══════════════════════════════════════════════════════════
-Lee el manual de principio a fin y lista:
-  A) Todos los tipos de usuario (ej: Ciudadano, Brigadista)
-  B) Para CADA usuario: TODAS las secciones/módulos descritos
-  C) Cada sección → su lane en el diagrama
+El diagrama debe comunicar el PROPÓSITO de cada sección, no documentar cada clic de la interfaz.
+Un director debe leerlo y entender el flujo en 30 segundos.
 
-REGLA DE ORO: si el manual describe una sección, DEBE aparecer como lane.
-No omitas ninguna. Si no estás seguro, inclúyela.
-
-═══════════════════════════════════════════════════════════
-REGLA 1 — LENGUAJE TÉCNICO OBLIGATORIO
-═══════════════════════════════════════════════════════════
-Nombres de tareas: QUÉ hace el actor, nunca CÓMO hace clic en la interfaz.
-  ❌ "Presionar 'Continuar'"       → ✅ "Confirmar datos del formulario"
-  ❌ "Dar clic en 'Cerrar sesión'" → ✅ "Cerrar sesión"
-  ❌ "Presionar ícono editar"      → ✅ "Seleccionar registro para editar"
-  ❌ Tocar / Pulsar / Presionar    → ✅ Ingresar / Validar / Seleccionar / Confirmar
+ANTES DE ESCRIBIR CADA TAREA, hazte esta pregunta:
+  "¿Qué LOGRA el usuario en este paso?" → eso es el nombre de la tarea.
+  "¿Cómo hace clic en la pantalla?" → eso NO va en el diagrama.
 
 ═══════════════════════════════════════════════════════════
-REGLA 2 — DIRECCIÓN DEL FLUJO (LEY FUNDAMENTAL DE LAYOUT)
+REGLA 1 — NOMBRES DE TAREAS: CONCISOS Y DESCRIPTIVOS
 ═══════════════════════════════════════════════════════════
-El diagrama se lee DE IZQUIERDA A DERECHA dentro de cada lane.
-Una flecha BAJA al siguiente lane SOLO si el proceso continúa ahí.
-Si el proceso termina, usa un endEvent — NUNCA bajes sin continuación.
+Máximo 4 palabras por nombre. Corto pero que se entienda el objetivo.
 
-FLUJO CORRECTO:
-  startEvent → task → task → task → endEvent
-                                        ↓ (solo si hay más proceso)
-                               intermediateEvent → task → endEvent
+  ❌ "Ingresar nombre de usuario y contraseña para autenticarse"
+  ✅ "Ingresar credenciales"
 
-• endEvent / endEventMessage → NUNCA tiene "next". Siempre "next": []
-• Cuando una sección TERMINA su trabajo → poner endEvent y listo.
-• Solo poner flecha al siguiente lane cuando la acción del lane actual
-  DESENCADENA directamente otra sección del proceso.
-• intermediateEvent = conector entre secciones. SIEMPRE: 1 entrada + 1 salida.
-• PROHIBIDO conectar nodos de distintos usuarios (Ciudadano ↔ Brigadista).
-• PROHIBIDO endEvent → cualquier otro nodo.
+  ❌ "Seleccionar la opción Quiero crear mi cuenta nueva"
+  ✅ "Crear cuenta nueva"
 
-CONECTAR SECCIONES CORRECTAMENTE:
+  ❌ "Presionar el botón Continuar para avanzar al siguiente paso"
+  ✅ "Confirmar datos"
+
+  ❌ "Dar clic en el ícono de editar para modificar el registro"
+  ✅ "Editar registro"
+
+  ❌ "Visualizar las opciones disponibles en el menú principal"
+  ✅ "Acceso a menú principal"
+
+Verbos preferidos: Ingresar · Validar · Confirmar · Seleccionar · Crear · Editar · Buscar · Registrar · Cerrar · Acceder · Generar · Enviar
+
+PROHIBIDO: Presionar · Pulsar · Tocar · Dar clic · Hacer clic · Botón · Ícono
+
+ANTI-PATRÓN — Secuencias técnicas repetitivas (muy común en sistemas con envío a SAJ o similar):
+  El manual describe: "guardar borrador", "enviar al sistema", "reintentar si falla", "recibir confirmación", "ver número de inventario"
+  Estos 5 pasos siempre ocurren igual en todos los módulos → consolidar en 2 tareas máximo:
+    "Registrar solicitud" + Gateway(¿Exitoso?) → "Recibir confirmación" / "Reintentar envío"
+  No repetir esta secuencia idéntica en cada módulo del manual.
+
+═══════════════════════════════════════════════════════════
+REGLA 2 — POOLS Y LANES (OBLIGATORIA)
+═══════════════════════════════════════════════════════════
+UN POOL = un actor, sistema o proceso diferenciado en el manual.
+El campo "pools" del JSON define cuántos diagramas se generarán — uno por pool.
+
+CUÁNDO crear múltiples pools:
+  • El manual describe N actores distintos (ciudadano, técnico, admin, brigadista…)
+  • El manual tiene secciones claramente independientes (Alta, Baja, Modificación…)
+  • El manual tiene capítulos que son procesos separados aunque usen el mismo sistema
+  → Un pool por cada actor o proceso independiente. Sin límite — puede ser 1, 2, 3, 4 o más.
+
+CUÁNDO crear un solo pool:
+  • Solo hay un actor usando el sistema
+  • Todas las secciones son módulos del mismo menú del mismo usuario
+
+NOMBRE DEL POOL: nombre real del sistema, rol o proceso. Ejemplos:
+  "Portal Ciudadano" · "Herramienta Brigadista" · "Bienes Técnicos - Altas" · "Bienes Técnicos - Bajas"
+  PROHIBIDO: "Proceso de Negocio", "Pool 1", "Pool A", nombres genéricos.
+
+ESTRUCTURA DE LANES dentro de cada pool:
+  1. Primer lane: startEvent + login + menú principal
+  2. [Un lane por cada módulo/sección, con el nombre exacto del módulo]
+  3. Último lane: cierre de sesión
+
+⚠️ NOMBRES DE LANES — REGLA CRÍTICA:
+  Cada lane en todo el JSON debe tener un nombre ÚNICO en todo el documento.
+  Si dos pools tienen un lane de login, NO pueden llamarse igual.
+  Usa el nombre del actor como sufijo: "Inicio de sesión Ciudadano", "Inicio de sesión Brigadista"
+  Lo mismo para "Cerrar sesión": "Cerrar sesión Ciudadano", "Cerrar sesión Brigadista"
+
+  ❌ PROHIBIDO (nombres duplicados entre pools):
+     Pool 1: ["Inicio de sesión", "Módulo A", "Cerrar sesión"]
+     Pool 2: ["Inicio de sesión", "Módulo B", "Cerrar sesión"]  ← INCORRECTO
+
+  ✅ CORRECTO (nombres únicos):
+     Pool 1: ["Inicio de sesión Ciudadano", "Módulo A", "Cerrar sesión Ciudadano"]
+     Pool 2: ["Inicio de sesión Brigadista", "Módulo B", "Cerrar sesión Brigadista"]
+
+LANE DE CIERRE — reglas especiales:
+  • Máximo 2-3 nodos: un intermediateEvent de entrada + 1 tarea + endEvent
+  • NUNCA un startEvent en el lane de cierre — siempre recibe desde el menú
+  • Ejemplo: Evt_CerrarSesion → Task_ConfirmarCierre → End_Sesion
+
+Cada pool tiene su propio startEvent. NUNCA conectar nodos entre pools distintos.
+
+═══════════════════════════════════════════════════════════
+REGLA 3 — CANTIDAD DE NODOS POR LANE (LÍMITE ESTRICTO)
+═══════════════════════════════════════════════════════════
+MÁXIMO ABSOLUTO: 7 nodos por lane. Este límite es INVIOLABLE.
+Objetivo ideal: entre 3 y 5 nodos por lane.
+
+ANTES de escribir el JSON, cuenta los nodos de cada lane mentalmente.
+Si llegas a 7 y aún tienes pasos pendientes → PARA y divide en Parte 1 / Parte 2.
+
+CÓMO RESPETAR EL LÍMITE — consolidar pasos relacionados en una sola tarea:
+
+  Patrón FORMULARIO (muy común en sistemas):
+    Manual: "ingresar nombre", "ingresar CURP", "ingresar correo", "ingresar teléfono"
+    Diagrama: UNA tarea "Completar formulario" o "Ingresar datos"
+    NUNCA una tarea por cada campo del formulario.
+
+  Patrón VALIDACIÓN:
+    Manual: "el sistema valida formato, verifica en BD, comprueba duplicados, muestra resultado"
+    Diagrama: UNA tarea "Validar datos"
+
+  Patrón DESCARGA/GENERACIÓN:
+    Manual: "el sistema genera el archivo", "muestra vista previa", "el usuario descarga"
+    Diagrama: UNA tarea "Generar y descargar documento"
+
+  Patrón CONFIRMACIÓN:
+    Manual: "el sistema muestra resumen", "el usuario revisa", "el usuario confirma", "el sistema guarda"
+    Diagrama: UNA tarea "Confirmar y guardar"
+
+MÓDULOS SIMILARES (misma app, distintas categorías):
+  Cuando el manual describe módulos parecidos (Alta Mayores, Alta Menores, Alta Compra Directa),
+  cada lane debe mostrar lo DIFERENTE y ÚNICO de ese módulo.
+  No copiar los mismos 8 pasos genéricos en cada lane — eso no aporta valor al diagrama.
+  Captura el propósito distintivo en 3-5 pasos concretos.
+
+═══════════════════════════════════════════════════════════
+REGLA 4 — FLUJO ENTRE SECCIONES
+═══════════════════════════════════════════════════════════
+• endEvent / endEventMessage → "next": [] siempre. Nunca conecta a otro nodo.
+• intermediateEvent → conector entre secciones. Exactamente 1 entrada y 1 salida.
+• PROHIBIDO conectar nodos entre usuarios distintos (Ciudadano ↔ Brigadista).
+
+CONECTAR SECCIONES:
   ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
-  ❌ última_tarea → endEvent → intermediateEvent  (endEvent no puede conectar)
-  ❌ intermediateEvent flotante sin nada apuntando a él (nodo huérfano)
-  ❌ End_SesionCerradaCiudadano → Evt_Brigadista  (cross-pool PROHIBIDO)
+  ❌ endEvent → intermediateEvent   (endEvent no puede conectar)
+  ❌ intermediateEvent sin nada que apunte a él (nodo huérfano)
 
-CUÁNDO BAJAR AL SIGUIENTE LANE (poner flecha hacia abajo):
-  ✅ Pre-registro completa → verificación de cuenta necesaria → bajar
-  ✅ Login exitoso → menú principal → bajar
-  ✅ Menú selecciona módulo → módulo correspondiente → bajar
-  ❌ Módulo A completa su tarea → NO baja al Módulo B (son ramas independientes)
-  ❌ Cerrar sesión completa → NO baja al proceso del otro usuario
+MENÚ CON MÓDULOS:
+  Task_Menu → "next": ["Evt_ModA", "Evt_ModB", "Evt_CerrarSesion"]
+  Cada Evt_Mod → tareas del módulo → endEvent  (no regresa al menú)
 
-MENÚ / HUB CON MÚLTIPLES MÓDULOS:
-  ✅ tarea_visualizar_menu → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
-  Cada Evt_ModX → primera tarea de ese módulo → ... → endEvent (no vuelve)
-  Evt_CerrarSesion → tarea cerrar sesión → endEvent
-
-MÓDULOS CON SUB-RAMAS (ej: Gestión tiene Crear Y Buscar/Editar):
-  ✅ Evt_Gestion → "next": ["Task_Crear", "Task_Buscar"]
-  Cada rama termina en su propio endEvent. NO intermediateEvents intermedios.
+MÓDULO CON SUB-OPCIONES (ej: Gestión de usuarios tiene Crear, Editar, Buscar):
+  Evt_Gestion → "next": ["Task_Crear", "Task_Editar", "Task_Buscar"]
+  Cada opción termina en su propio endEvent.
 
 ═══════════════════════════════════════════════════════════
-REGLA 3 — ESTRUCTURA DE LANES (OBLIGATORIA)
+REGLA 5 — NO INVENTAR
 ═══════════════════════════════════════════════════════════
-Cada lane = UNA sección funcional. Orden fijo para cada tipo de usuario:
-
-  1. Inicio de sesión         ← startEvent va aquí
-  2. Pre-registro (si existe) ← dividir en Parte 1 / Parte 2 si > 5 nodos
-  3. Recuperación contraseña  ← si el manual lo describe
-  4. Verificación de cuenta   ← si el manual lo describe
-  5. Menú principal           ← siempre presente
-  6. [Un lane por cada módulo listado en el menú]
-  7. Cerrar sesión            ← siempre el último
-
-Si hay DOS tipos de usuario → DOS bloques de lanes independientes, cada uno con su startEvent.
-NO crear gateway de selección de usuario/portal — son flujos separados.
-
-TODOS los módulos del menú deben tener su propio lane.
-Si el menú lista 6 módulos → 6 lanes de módulos. No resumir en uno solo.
-
-REGLA DE "PARTE 1.2" PARA SECCIONES MULTI-FASE:
-Si una sección tiene pasos que continúan en otra sub-sección (ej: Pre-registro
-parte 2 lleva a verificación, pero Pre-registro parte 2.2 tiene pasos adicionales):
-  ✅ La sub-sección "Parte X.2" puede contener: intermediateEvent de continuación
-     + las tareas siguientes. El endEvent de la parte anterior (X.1) se convierte
-     en intermediateEvent si el flujo continúa en la siguiente parte.
-  ❌ No dejar intermediateEvents sin incoming — siempre debe haber algo apuntando a ellos.
+Solo modela lo que el manual describe. Si algo no está claro → omítelo.
+  ❌ Gateways de selección de tipo de usuario — PROHIBIDO
+  ❌ Tareas o lanes no mencionados en el manual — PROHIBIDO
 
 ═══════════════════════════════════════════════════════════
-REGLA 4 — NO INVENTAR
+REGLA 6 — REGLAS TÉCNICAS
 ═══════════════════════════════════════════════════════════
-Solo incluye lo que el manual describe explícitamente.
-  ❌ Gateways de selección de rol/tipo de usuario — PROHIBIDO
-  ❌ Lanes o pasos no mencionados en el manual — PROHIBIDO
-  En caso de duda: omite el paso. Diagrama incompleto > diagrama con pasos falsos.
-
-═══════════════════════════════════════════════════════════
-REGLA 5 — REGLAS TÉCNICAS
-═══════════════════════════════════════════════════════════
-• UN startEvent por tipo de usuario, siempre en su lane de inicio.
-• IDs únicos, sin espacios: Start_Xxx, Task_Xxx, GW_Xxx, Evt_Xxx, End_Xxx
-• NUNCA referencias circulares directas: A → B → A
-• "conditions" obligatorio en exclusiveGateway con más de una salida.
-• ⚠️ LÍMITE ESTRICTO: Máximo 7 nodos por lane. CONTAR los nodos antes de escribir cada lane.
-  Si un lane tiene 8 pasos → dividir en "Sección - Parte 1" (nodos 1-7) y "Sección - Parte 2" (nodo 8+).
-  Si Parte 2 tiene >7 → crear "Parte 3". Ejemplo: 10 nodos = Parte 1 (7) + Parte 2 (3).
-  NUNCA escribir un lane con más de 7 nodos. Verificar CADA lane antes de cerrar el JSON.
-• steps[] ordenado: startEvent primero, luego nodo por nodo en orden de flujo.
+• Un startEvent por tipo de usuario, en su primer lane.
+• IDs únicos sin espacios: Start_Xxx  Task_Xxx  GW_Xxx  Evt_Xxx  End_Xxx
+• Sin referencias circulares: A → B → A está prohibido.
+• exclusiveGateway con más de una salida → campo "conditions" obligatorio.
+• steps[] en orden de flujo: startEvent primero.
 
 TIPOS DE NODO:
-  startEvent               → Inicio del proceso. Solo uno por flujo de usuario.
-  endEvent                 → Fin de sección (sin notificación). "next": [] siempre.
-  endEventMessage          → Fin con notificación al usuario. "next": [] siempre.
-  userTask                 → Acción del usuario: Ingresar, Seleccionar, Confirmar, Revisar...
-  serviceTask              → Llamada a sistema externo o API.
-  scriptTask               → Validación o procesamiento interno del sistema.
-  exclusiveGateway         → Decisión (rombo). Requiere "conditions" con etiqueta por salida.
-  intermediateEvent        → Conector entre secciones / inicio de módulo. 1 entrada, 1 salida.
-  intermediateEventMessage → Notificación/mensaje en el flujo (email, código, alerta).
+  startEvent               → Inicio del proceso (un círculo verde). Nombre corto y directo: "Inicio de sesión", "Pre-registro", "Inicio". NUNCA "Inicio Ciudadano" ni "Inicio del proceso de X".
+  endEvent                 → Fin de sección. "next": [] siempre.
+  endEventMessage          → Fin con notificación (email, SMS). "next": [] siempre.
+  userTask                 → Acción del usuario en pantalla.
+  serviceTask              → Llamada a API o sistema externo.
+  scriptTask               → Validación o proceso interno del sistema.
+  exclusiveGateway         → Decisión. Requiere "conditions" por cada salida.
+  intermediateEvent        → Conector entre secciones. Nombre = el módulo o sección destino, SIN "Iniciar", SIN "Inicio de". Ejemplos: "Pre-registro", "Mis dependientes", "Módulos", "Cerrar sesión". NUNCA "Iniciar pre-registro" ni "Inicio del módulo".
+  intermediateEventMessage → Notificación dentro del flujo (envío de código, alerta). Nombre descriptivo corto: "Enviar código", "Código enviado".
 
 ═══════════════════════════════════════════════════════════
-EJEMPLO DE ESTRUCTURA CORRECTA (estructura, no contenido real)
+REGLA 7 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
 ═══════════════════════════════════════════════════════════
+Cuando el manual describe muchos módulos similares (Alta, Baja, Modificación, consultas, etc.):
+
+1. ABSTRAE, NO COPIES:
+   El diagrama no es una transcripción del manual — es un resumen ejecutivo visual.
+   Si 3 módulos tienen el mismo flujo técnico, no dibujes 3 veces los mismos 8 pasos.
+   Cada lane debe capturar lo que lo hace DISTINTO: qué tipo de bien, qué validación especial,
+   qué autorización requiere, qué documentos genera.
+
+2. CUENTA NODOS ANTES DE ESCRIBIR:
+   Para cada lane, lista mentalmente los pasos, agrúpalos en tareas y verifica que no pasen de 7.
+   Si pasas de 7 al contar → consolida más antes de escribir el JSON.
+
+3. PASOS ADMINISTRATIVOS ESTÁNDAR → UN SOLO NODO:
+   "guardar borrador / preguardar / guardar temporalmente" → "Guardar borrador"
+   "enviar + reintentar si falla" → gateway + "Enviar solicitud" / "Reintentar"
+   "recibir número de inventario / folio / confirmación" → "Recibir confirmación"
+   "adjuntar archivo / documento" → "Adjuntar documentos" (fusionar con el paso anterior si es parte del mismo formulario)
+
+4. LO QUE SÍ VALE LA PENA SEPARAR en módulos grandes:
+   - Gateways de decisión con rutas distintas (Rechazar vs Autorizar)
+   - Pasos que requieren una persona distinta (usuario vs revisor vs autorizador)
+   - Generación de documentos de salida (vale, etiqueta, reporte)
+   - Notificaciones externas (endEventMessage)
+
+═══════════════════════════════════════════════════════════
+EJEMPLO REAL basado en un diagrama profesional de referencia
+═══════════════════════════════════════════════════════════
+Este ejemplo muestra el nivel de concisión y estructura esperados:
+
+Portal Ciudadano — lanes: "Pre-registro · Recuperar contraseña · Inicio de sesión y menú · Actualizar mis datos · Unidades de Salud · Mis dependientes · Cerrar sesión"
+
+Lane "Inicio de sesión y menú":
+  Start → "Ingresar credenciales" → "Validar acceso" → Gateway(Correcto/Incorrecto) →
+    [Incorrecto] → "Solicitar nuevo código" → vuelve a Validar
+    [Correcto]   → "Acceso a ventana principal" → IntermediateEvent(Módulos) →
+      [Módulo A] [Módulo B] [Módulo C] [Cerrar sesión]
+
+Lane "Mis dependientes":
+  IntEvt → "Nuevo dependiente" → Gateway(¿Registrado?) →
+    [Registrado]     → "Mensaje informativo" (endEventMessage)
+    [No registrado]  → "Confirmar datos" → Gateway(¿Acepta?) →
+      [No] → fin
+      [Sí] → "Información de contacto" → "Generar credencial" → fin
+
 [MD_START]
-**Lanes:** lista completa de secciones identificadas
+**Usuarios identificados:** lista de tipos de usuario
+**Lanes:** lista completa en orden
 **Pasos totales:** número
-**Flujo general:** 2-3 líneas
+**Flujo general:** 2-3 líneas resumiendo el proceso
 [MD_END]
 [JSON_START]
 {
-  "roles": ["Inicio de sesión", "Pre-registro", "Verificación de cuenta", "Menú principal", "Módulo A", "Módulo B", "Cerrar sesión"],
+  "pools": [
+    { "name": "Sistema X - Proceso A", "roles": ["Inicio de sesión y menú", "Módulo A", "Cerrar sesión"] },
+    { "name": "Sistema X - Proceso B", "roles": ["Inicio de sesión y menú B", "Módulo B", "Cerrar sesión B"] }
+  ],
   "steps": [
-    { "id": "Start_Login", "name": "Iniciar proceso", "type": "startEvent", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
-    { "id": "Task_Credenciales", "name": "Ingresar credenciales de acceso", "type": "userTask", "role": "Inicio de sesión", "next": ["Script_ValidarLogin"] },
-    { "id": "Script_ValidarLogin", "name": "Validar credenciales", "type": "scriptTask", "role": "Inicio de sesión", "next": ["GW_Login"] },
-    { "id": "GW_Login", "name": "¿Autenticación exitosa?", "type": "exclusiveGateway", "role": "Inicio de sesión", "next": ["Evt_Menu", "Task_ErrorLogin"], "conditions": {"Evt_Menu": "Sí", "Task_ErrorLogin": "No"} },
-    { "id": "Task_ErrorLogin", "name": "Mostrar error de autenticación", "type": "userTask", "role": "Inicio de sesión", "next": ["Task_Credenciales"] },
-    { "id": "Evt_PreRegistro", "name": "Iniciar pre-registro", "type": "intermediateEvent", "role": "Pre-registro", "next": ["Task_LlenarFormulario"] },
-    { "id": "Task_LlenarFormulario", "name": "Completar formulario de registro", "type": "userTask", "role": "Pre-registro", "next": ["End_PreRegistro"] },
-    { "id": "End_PreRegistro", "name": "Pre-registro completado", "type": "endEvent", "role": "Pre-registro", "next": [] },
-    { "id": "Evt_Menu", "name": "Acceso al menú principal", "type": "intermediateEvent", "role": "Menú principal", "next": ["Task_VerMenu"] },
-    { "id": "Task_VerMenu", "name": "Visualizar opciones del menú", "type": "userTask", "role": "Menú principal", "next": ["Evt_ModuloA", "Evt_ModuloB", "Evt_CerrarSesion"] },
-    { "id": "Evt_ModuloA", "name": "Iniciar Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
-    { "id": "Task_AccionA", "name": "Ejecutar acción del módulo A", "type": "userTask", "role": "Módulo A", "next": ["End_ModuloA"] },
-    { "id": "End_ModuloA", "name": "Módulo A completado", "type": "endEventMessage", "role": "Módulo A", "next": [] },
-    { "id": "Evt_ModuloB", "name": "Iniciar Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
-    { "id": "Task_AccionB", "name": "Ejecutar acción del módulo B", "type": "userTask", "role": "Módulo B", "next": ["End_ModuloB"] },
-    { "id": "End_ModuloB", "name": "Módulo B completado", "type": "endEventMessage", "role": "Módulo B", "next": [] },
-    { "id": "Evt_CerrarSesion", "name": "Iniciar cierre de sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_ConfirmarCierre"] },
-    { "id": "Task_ConfirmarCierre", "name": "Confirmar cierre de sesión", "type": "userTask", "role": "Cerrar sesión", "next": ["End_SesionCerrada"] },
-    { "id": "End_SesionCerrada", "name": "Sesión cerrada exitosamente", "type": "endEventMessage", "role": "Cerrar sesión", "next": [] }
+    { "id": "Start_A", "name": "Inicio de sesión", "type": "startEvent", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
+    { "id": "Task_Credenciales", "name": "Ingresar credenciales", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Script_Validar"] },
+    { "id": "Script_Validar", "name": "Validar acceso", "type": "scriptTask", "role": "Inicio de sesión y menú", "next": ["GW_Login"] },
+    { "id": "GW_Login", "name": "¿Acceso correcto?", "type": "exclusiveGateway", "role": "Inicio de sesión y menú", "next": ["Task_ErrorLogin", "Task_Menu"], "conditions": {"Task_ErrorLogin": "No", "Task_Menu": "Sí"} },
+    { "id": "Task_ErrorLogin", "name": "Mostrar error de acceso", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
+    { "id": "Task_Menu", "name": "Acceso a ventana principal", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Evt_ModA", "Evt_Cerrar"] },
+    { "id": "Evt_ModA", "name": "Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
+    { "id": "Task_AccionA", "name": "Ejecutar acción A", "type": "userTask", "role": "Módulo A", "next": ["End_ModA"] },
+    { "id": "End_ModA", "name": "Operación realizada", "type": "endEventMessage", "role": "Módulo A", "next": [] },
+    { "id": "Evt_Cerrar", "name": "Cerrar sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_Cerrar"] },
+    { "id": "Task_Cerrar", "name": "Confirmar cierre", "type": "userTask", "role": "Cerrar sesión", "next": ["End_Sesion"] },
+    { "id": "End_Sesion", "name": "Cerrar sesión", "type": "endEvent", "role": "Cerrar sesión", "next": [] },
+    { "id": "Start_B", "name": "Inicio de sesión", "type": "startEvent", "role": "Inicio de sesión y menú B", "next": ["Task_CredB"] },
+    { "id": "Task_CredB", "name": "Ingresar credenciales", "type": "userTask", "role": "Inicio de sesión y menú B", "next": ["Evt_ModB", "Evt_CerrarB"] },
+    { "id": "Evt_ModB", "name": "Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
+    { "id": "Task_AccionB", "name": "Ejecutar acción B", "type": "userTask", "role": "Módulo B", "next": ["End_ModB"] },
+    { "id": "End_ModB", "name": "Operación realizada", "type": "endEventMessage", "role": "Módulo B", "next": [] },
+    { "id": "Evt_CerrarB", "name": "Cerrar sesión", "type": "intermediateEvent", "role": "Cerrar sesión B", "next": ["Task_CerrarB"] },
+    { "id": "Task_CerrarB", "name": "Confirmar cierre", "type": "userTask", "role": "Cerrar sesión B", "next": ["End_SesionB"] },
+    { "id": "End_SesionB", "name": "Cerrar sesión", "type": "endEvent", "role": "Cerrar sesión B", "next": [] }
   ]
 }
 [JSON_END]
@@ -677,18 +670,10 @@ EJEMPLO DE ESTRUCTURA CORRECTA (estructura, no contenido real)
 MANUAL A ANALIZAR:
 ${text}`;
 }
-// ============================================================
-// 6. ENDPOINT PRINCIPAL
-// ============================================================
 
-// Manejo de errores de multer (archivos muy grandes, tipo incorrecto)
 function multerErrorHandler(err, req, res, next) {
-    if (err && err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ error: 'El archivo es demasiado grande. Máximo 50 MB.' });
-    }
-    if (err) {
-        return res.status(400).json({ error: err.message || 'Error al procesar el archivo.' });
-    }
+    if (err && err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'El archivo es demasiado grande. Máximo 50 MB.' });
+    if (err) return res.status(400).json({ error: err.message || 'Error al procesar el archivo.' });
     next();
 }
 
@@ -701,33 +686,21 @@ app.post('/analyze', (req, res, next) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Archivo no recibido.' });
 
-        // ── Extraer texto del PDF ─────────────────────────────────────────
         let pdfData;
         try {
-            pdfData = await pdf(req.file.buffer, { max: 0 });  // max:0 = todas las páginas
+            pdfData = await pdf(req.file.buffer, { max: 0 });
         } catch (pdfErr) {
-            console.error('Error al parsear PDF:', pdfErr.message);
-            return res.status(400).json({ error: 'No se pudo leer el PDF. Verifica que no esté protegido o corrupto.' });
+            return res.status(400).json({ error: 'No se pudo leer el PDF.' });
         }
 
         const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
         const manualText = rawText.substring(0, CONFIG.maxPdfChars);
+        if (manualText.length < 100) return res.status(400).json({ error: 'El PDF no contiene texto extraíble.' });
 
-        if (manualText.length < 100) {
-            return res.status(400).json({ error: 'El PDF no contiene texto extraíble. Puede ser un PDF de imágenes (escaneado).' });
-        }
-
-        // ── Subir PDF a Gemini File API para archivos grandes ────────────────
-        // La File API acepta hasta 50 MB y permite que Gemini lea el PDF directamente
-        // con OCR nativo — mucho mejor que extraer texto con pdf-parse (que pierde tablas,
-        // imágenes, columnas, etc.). Lo usamos siempre que el archivo > 500 KB.
         let geminiFileUri = null;
-        const USE_FILE_API = req.file.size > 500 * 1024;  // >500 KB → File API
-
+        const USE_FILE_API = req.file.size > 500 * 1024;
         if (USE_FILE_API) {
             try {
-                console.log(`PDF grande (${(req.file.size/1024/1024).toFixed(1)} MB) — subiendo a Gemini File API...`);
-                // Subir usando fetch a la File API de Gemini
                 const uploadRes = await fetch(
                     `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`,
                     {
@@ -746,45 +719,26 @@ app.post('/analyze', (req, res, next) => {
                     geminiFileUri = fileData.file?.uri;
                     console.log(`✓ PDF subido a File API: ${geminiFileUri}`);
                 } else {
-                    const errText = await uploadRes.text();
-                    console.warn(`File API falló (${uploadRes.status}): ${errText} — usando texto extraído`);
+                    console.warn(`File API falló (${uploadRes.status}) — usando texto extraído`);
                 }
-            } catch (fileApiErr) {
-                console.warn(`File API error: ${fileApiErr.message} — usando texto extraído`);
+            } catch (e) {
+                console.warn(`File API error: ${e.message} — usando texto extraído`);
             }
         }
 
-        console.log(`PDF: ${req.file.size} bytes, ${pdfData.numpages} páginas, ${rawText.length} chars extraídos${geminiFileUri ? ' + File API' : ` → usando ${manualText.length} chars`}`);
+        console.log(`PDF: ${req.file.size} bytes, ${pdfData.numpages} pág.`);
         const t0 = Date.now();
 
         const model = genAI.getGenerativeModel({
             model: CONFIG.model,
-            generationConfig: {
-                temperature:     CONFIG.temperature,
-                maxOutputTokens: CONFIG.maxTokens,
-            },
+            generationConfig: { temperature: CONFIG.temperature, maxOutputTokens: CONFIG.maxTokens },
         });
 
-        // ── OpenClaw: análisis estructural previo (opcional) ─────────────
-        let openclawAnalysis = null;
-        if (analyzeManual) {
-            try {
-                console.log('Ejecutando análisis con OpenClaw...');
-                openclawAnalysis = await analyzeManual(manualText);
-                if (openclawAnalysis) console.log('OpenClaw completó el análisis.');
-            } catch(err) {
-                console.log('OpenClaw no disponible, continuando con Gemini.');
-            }
-        }
-
-        // ── Llamada a Gemini — con File API o texto plano ────────────────
         async function callGemini(promptText) {
             for (let attempt = 0; attempt < 4; attempt++) {
                 try {
-                    console.log(`Llamando a Gemini (intento ${attempt + 1}/4)...`);
                     let result;
                     if (geminiFileUri) {
-                        // File API: enviar el PDF como parte del contenido
                         result = await model.generateContent([
                             promptText.replace(/\nMANUAL A ANALIZAR:\n[\s\S]*$/, '\nMANUAL A ANALIZAR: [Ver PDF adjunto]'),
                             { fileData: { mimeType: 'application/pdf', fileUri: geminiFileUri } },
@@ -805,490 +759,384 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
-        // Construir texto enriquecido con OpenClaw si está disponible
-        function enrichText(base, processInfo = null) {
-            if (!openclawAnalysis && !processInfo) return base;
-            let enriched = '';
-            if (openclawAnalysis) {
-                enriched += `ANÁLISIS DEL SISTEMA:\n${JSON.stringify(openclawAnalysis, null, 2)}\n\n`;
-            }
-            if (processInfo) {
-                enriched += `PROCESO: ${processInfo.name}\nDESCRIPCIÓN: ${processInfo.description || ''}\nACTORES: ${(processInfo.actors || []).join(', ')}\n\n`;
-            }
-            enriched += `MANUAL:\n${base}`;
-            return enriched;
-        }
+        const raw = await callGemini(buildPrompt(manualText));
+        console.log(`Gemini respondió en ${((Date.now() - t0)/1000).toFixed(1)}s`);
 
-        // ── Multi-diagrama si detectBusinessProcesses está disponible ─────
-        let rawJsonList = [];   // [{raw, name}]
-
-        if (detectBusinessProcesses) {
-            const detectedProcesses = await detectBusinessProcesses(manualText);
-            console.log(`Procesos detectados: ${detectedProcesses.length}`);
-
-            for (const process of detectedProcesses) {
-                console.log(`Generando BPMN para: ${process.name}`);
-                try {
-                    const raw = await callGemini(buildPrompt(enrichText(manualText, process)));
-                    rawJsonList.push({ raw, name: process.name });
-                } catch(e) {
-                    console.warn(`Diagrama "${process.name}" falló: ${e.message}`);
-                }
-            }
-        }
-
-        // Fallback: llamada única si no hay detectBusinessProcesses o no detectó nada
-        if (rawJsonList.length === 0) {
-            console.log('Generando diagrama único...');
-            const raw = await callGemini(buildPrompt(enrichText(manualText)));
-            rawJsonList.push({ raw, name: 'Proceso Principal' });
-        }
-
-        // ── Parsear cada respuesta ────────────────────────────────────────
-        function extractJson(responseText) {
-            const mdMatch   = responseText.match(/\[MD_START\]([\s\S]*?)\[MD_END\]/);
-            const jsonMatch = responseText.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
-            let rawJson = null;
-            if (jsonMatch) {
-                rawJson = jsonMatch[1];
-            } else {
-                const partial = responseText.match(/\[JSON_START\]([\s\S]*)/);
-                if (partial) { console.warn('Respuesta truncada — reparando...'); rawJson = partial[1]; }
-            }
-            return { mdMatch, rawJson };
-        }
-
-        const { mdMatch, rawJson: rawJsonFirst } = extractJson(rawJsonList[0].raw);
-        let rawJson = rawJsonFirst;
-
+        const mdMatch   = raw.match(/\[MD_START\]([\s\S]*?)\[MD_END\]/);
+        const jsonMatch = raw.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
+        let rawJson = jsonMatch ? jsonMatch[1] : null;
         if (!rawJson) {
-            console.error('Sin JSON en respuesta:', rawJsonList[0].raw.substring(0, 300));
-            throw new Error('Gemini no devolvió JSON válido. Intenta de nuevo.');
+            const partial = raw.match(/\[JSON_START\]([\s\S]*)/);
+            if (partial) { console.warn('Respuesta truncada — reparando...'); rawJson = partial[1]; }
         }
+        if (!rawJson) throw new Error('Gemini no devolvió JSON válido. Intenta de nuevo.');
 
-        // Guardar todos los raws para procesar después
-        const allRawJsons = rawJsonList.map(({ raw, name }) => {
-            const { rawJson } = extractJson(raw);
-            return { rawJson, name };
-        }).filter(x => x.rawJson);
-
-        console.log(`Gemini respondió en ${((Date.now() - t0) / 1000).toFixed(1)}s — ${rawJsonList.length} diagrama(s)`);
-
-        // Parsear JSON, reparando truncamientos y limpiando comentarios
         let structure;
         try {
-            let jsonStr = rawJson.replace(/```json|```/g, '').trim();
-
-            // 1. Eliminar comentarios de línea  (// ...) que Gemini a veces inserta
-            jsonStr = jsonStr.replace(/\/\/[^\n\r"]*/g, '');
-
-            // 2. Eliminar comentarios de bloque (/* ... */)
-            jsonStr = jsonStr.replace(/\/\*[\s\S]*?\*\//g, '');
-
-            // 3. Eliminar comas sobrantes antes de ] o } (trailing commas)
-            jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
-
-            // 4. Cerrar JSON truncado si termina sin '}'
-            if (!jsonStr.trimEnd().endsWith('}')) {
-                const lastBrace = jsonStr.lastIndexOf('}');
-                if (lastBrace > 0) {
-                    jsonStr = jsonStr.substring(0, lastBrace + 1) + '\n  ]\n}';
-                    console.warn('JSON cerrado automáticamente (estaba truncado).');
-                }
+            let js = rawJson.replace(/```json|```/g, '').trim();
+            js = js.replace(/\/\/[^\n\r"]*/g, '');
+            js = js.replace(/\/\*[\s\S]*?\*\//g, '');
+            js = js.replace(/,\s*([}\]])/g, '$1');
+            if (!js.trimEnd().endsWith('}')) {
+                const lb = js.lastIndexOf('}');
+                if (lb > 0) { js = js.substring(0, lb + 1) + '\n  ]\n}'; console.warn('JSON cerrado automáticamente.'); }
             }
+            structure = JSON.parse(js);
+        } catch (e) { throw new Error(`JSON inválido: ${e.message}`); }
 
-            structure = JSON.parse(jsonStr);
-        } catch (e) {
-            throw new Error(`JSON inválido: ${e.message}`);
+        // Si Gemini devolvió pools[] pero no roles[] al nivel raíz, derivar roles de pools
+        if (!structure.roles?.length && structure.pools?.length) {
+            structure.roles = structure.pools.flatMap(p => p.roles || []);
+            console.log('roles derivados de pools[]: ' + structure.roles.length + ' roles');
+        }
+        if (!structure.roles?.length || !structure.steps?.length) throw new Error('Sin roles o pasos válidos.');
+
+        const validIds = new Set(structure.steps.map(s => s.id));
+
+        // PRE-FIX: Cuando Gemini usa el mismo nombre de lane en múltiples pools
+        // (ej: "Inicio de sesión" en Pool Ciudadano Y Pool Brigadista),
+        // structure.roles tiene ese nombre duplicado.
+        // Solución: renombrar con sufijo de pool para que sean únicos.
+        // Los pasos del primer pool que use ese nombre conservan el role original renombrado.
+        // Los pools siguientes reciben un startEvent mínimo via FIX9.
+        if (structure.pools?.length > 1) {
+            // Construir mapa: roleName → [poolIndex, ...]
+            const rolePoolIdx = {};
+            structure.pools.forEach((pool, pi) => {
+                (pool.roles || []).forEach(r => {
+                    if (!rolePoolIdx[r]) rolePoolIdx[r] = [];
+                    rolePoolIdx[r].push(pi);
+                });
+            });
+            // Para cada role que aparece en >1 pool, renombrar
+            Object.entries(rolePoolIdx).forEach(([r, pis]) => {
+                if (pis.length < 2) return;
+                pis.forEach((pi, occurrence) => {
+                    const newName = r + ' · ' + (pi + 1);
+                    structure.pools[pi].roles = structure.pools[pi].roles.map(x => x === r ? newName : x);
+                    if (occurrence === 0) {
+                        // Primer pool: reasignar pasos existentes
+                        structure.steps.forEach(s => { if (s.role === r) s.role = newName; });
+                        console.warn(`PRE-FIX: "${r}" → "${newName}" (pool ${pi})`);
+                    } else {
+                        // Pools siguientes: no tienen pasos propios para ese role — FIX9 se encarga
+                        console.warn(`PRE-FIX: pool ${pi} reclama "${r}" → "${newName}" (sin pasos, FIX9 lo maneja)`);
+                    }
+                });
+            });
+            // Reconstruir structure.roles desde pools actualizados
+            structure.roles = structure.pools.flatMap(p => p.roles);
+            console.warn('PRE-FIX roles: ' + structure.roles.length + ' roles tras normalización');
         }
 
-        if (!structure.roles?.length || !structure.steps?.length) {
-            throw new Error('Respuesta de Gemini sin roles o pasos válidos.');
-        }
-
-        // ── Post-procesado: corregir errores comunes del modelo ─────────────
-        const stepMap_v = Object.fromEntries(structure.steps.map(s => [s.id, s]));
-        const validIds  = new Set(structure.steps.map(s => s.id));
-
-        // FIX 0: AUTO-SPLIT lanes con > 7 nodos LINEALES
-        // Solo divide lanes donde los nodos son genuinamente secuenciales (sin ciclos internos).
-        // Si un lane tiene ciclos (gateway con rama de error hacia atrás), NO lo divide —
-        // dividirlo rompería el ciclo. Solo divide lanes que son puramente lineales.
+                // FIX 0: AUTO-SPLIT lanes con > 7 nodos lineales
         {
             const MAX_LANE_NODES = 7;
             const bridgeIds = new Set();
             let pass = 0, changed = true;
-
             while (changed && pass < 10) {
                 changed = false; pass++;
+                // Deduplicar structure.steps por ID antes de procesar
+                // Evita multiplicación exponencial si hay roles duplicados
+                {
+                    const seen = new Set();
+                    structure.steps = structure.steps.filter(s => {
+                        if (seen.has(s.id)) return false;
+                        seen.add(s.id); return true;
+                    });
+                }
                 const newRoles = [], newSteps = [];
-
-                structure.roles.forEach(role => {
+                structure.roles.forEach((role, roleIdx) => {
                     const laneSteps = structure.steps.filter(s => s.role === role);
                     const realCount = laneSteps.filter(s => !bridgeIds.has(s.id)).length;
-
                     if (realCount <= MAX_LANE_NODES) {
                         newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return;
                     }
-
-                    // Detectar ciclos internos — si hay un backward edge, no dividir
                     const laneIds = new Set(laneSteps.map(s => s.id));
                     const laneIdxMap = {};
                     laneSteps.forEach((s, i) => { laneIdxMap[s.id] = i; });
                     let hasCycle = false;
                     laneSteps.forEach(s => {
                         (s.next || []).forEach(nid => {
-                            if (laneIds.has(nid) && (laneIdxMap[nid] < laneIdxMap[s.id])) {
-                                hasCycle = true;
-                            }
+                            if (laneIds.has(nid) && laneIdxMap[nid] < laneIdxMap[s.id]) hasCycle = true;
                         });
                     });
-
-                    if (hasCycle) {
-                        // No dividir — lane con ciclo (gateway error→retry): dejar como está
-                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return;
-                    }
-
-                    // Lane lineal con >7 nodos: dividir
+                    if (hasCycle) { newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return; }
                     changed = true;
                     const base = role.replace(/\s*-\s*Parte\s*[\d\.]+$/i, '').trim();
-                    // Usar el índice global del rol para garantizar nombres únicos
-                    const roleIdx = structure.roles.indexOf(role);
-                    const p1n = `${base} - Parte ${roleIdx}.1`;
-                    const p2n = `${base} - Parte ${roleIdx}.2`;
-                    const p1s = laneSteps.slice(0, MAX_LANE_NODES);
-                    const p2s = laneSteps.slice(MAX_LANE_NODES);
-
+                    // roleIdx ya viene del forEach — único por posición, evita colisiones con nombres iguales
+                    const p1n = `${base} - Parte ${roleIdx}.1`, p2n = `${base} - Parte ${roleIdx}.2`;
+                    const p1s = laneSteps.slice(0, MAX_LANE_NODES), p2s = laneSteps.slice(MAX_LANE_NODES);
                     const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
                     const bid = `EvtBr_${safeBase}_${pass}`;
                     bridgeIds.add(bid);
-
-                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`,
-                        type: 'intermediateEvent', role: p2n, next: [p2s[0].id] };
-
+                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: p2n, next: [p2s[0].id] };
                     const last = p1s[p1s.length - 1];
-                    if (last.type?.startsWith('endEvent') && !(last.next || []).length) {
-                        last.type = 'intermediateEvent'; last.next = [bid];
-                    } else if (!last.type?.startsWith('endEvent') && !(last.next || []).includes(bid)) {
-                        last.next = [...(last.next || []), bid];
-                    }
-
+                    if (last.type?.startsWith('endEvent') && !(last.next || []).length) { last.type = 'intermediateEvent'; last.next = [bid]; }
+                    else if (!last.type?.startsWith('endEvent') && !(last.next || []).includes(bid)) { last.next = [...(last.next || []), bid]; }
                     p1s.forEach(s => { s.role = p1n; }); p2s.forEach(s => { s.role = p2n; });
                     newRoles.push(p1n, p2n);
                     p1s.forEach(s => newSteps.push(s)); newSteps.push(bridge); p2s.forEach(s => newSteps.push(s));
-
-                    console.warn(`FIX0: "${role}" (${realCount}) → "${p1n}" (${p1s.length}) + "${p2n}" (${p2s.length})`);
+                    console.warn(`FIX0: "${role}" → "${p1n}" + "${p2n}"`);
                 });
-
-                if (changed) { structure.roles = newRoles; structure.steps = newSteps; }
+                if (changed) {
+                    structure.roles = newRoles;
+                    structure.steps = newSteps;
+                    // Sincronizar structure.pools con los nuevos nombres de roles.
+                    // FIX0 renombra 'Pre-registro' → 'Pre-registro - Parte 1.1' + 'Pre-registro - Parte 1.2'
+                    // Sin esto, pools[i].roles sigue con el nombre viejo → lanes vacíos en el pool correcto
+                    // y nodos cayendo en el pool equivocado.
+                    if (structure.pools?.length) {
+                        structure.pools.forEach(pool => {
+                            const updated = [];
+                            pool.roles.forEach(origRole => {
+                                // Buscar si este rol fue dividido en partes
+                                const replacements = newRoles.filter(nr =>
+                                    nr === origRole ||                          // sin cambio
+                                    nr.startsWith(origRole + ' - Parte ')       // fue dividido
+                                );
+                                if (replacements.length) updated.push(...replacements);
+                                else updated.push(origRole); // rol que no existe más — se limpiará en FIX3
+                            });
+                            pool.roles = [...new Set(updated)]; // deduplicar por si acaso
+                        });
+                        console.warn('FIX0-pools: structure.pools actualizado con roles divididos');
+                    }
+                }
             }
         }
 
-        // FIX 1: endEvent nunca puede tener next[]
+        // FIX 1: endEvent sin next
         structure.steps.forEach(step => {
-            if (step.type?.startsWith('endEvent') && step.next?.length) {
-                console.warn(`FIX1: endEvent "${step.id}" tenía next=[${step.next}] — eliminando`);
-                step.next = [];
-            }
+            if (step.type?.startsWith('endEvent') && step.next?.length) { step.next = []; console.warn(`FIX1: ${step.id}`); }
         });
 
-        // FIX 2: eliminar referencias a IDs inexistentes en next[]
+        // FIX 2: referencias inexistentes
         structure.steps.forEach(step => {
-            const before = (step.next || []).length;
-            step.next = (step.next || []).filter(nid => {
-                if (!validIds.has(nid)) {
-                    console.warn(`FIX2: "${step.id}" apunta a "${nid}" inexistente — eliminado`);
-                    return false;
-                }
-                return true;
-            });
+            step.next = (step.next || []).filter(nid => { if (!validIds.has(nid)) { console.warn(`FIX2: ${step.id}→${nid} eliminado`); return false; } return true; });
         });
 
-        // FIX 3: roles desconocidos → primer rol
+        // FIX 3: roles desconocidos
         structure.steps.forEach(step => {
-            if (!structure.roles.includes(step.role)) {
-                console.warn(`FIX3: rol desconocido "${step.role}" → ${structure.roles[0]}`);
-                step.role = structure.roles[0];
-            }
+            if (!structure.roles.includes(step.role)) { console.warn(`FIX3: rol desconocido "${step.role}"`); step.role = structure.roles[0]; }
         });
 
-        // FIX 4: exclusiveGateway sin salidas → conectar a los 2 siguientes en steps[]
+        // FIX 4: gateway sin salidas
         structure.steps.forEach((step, idx) => {
             if (step.type === 'exclusiveGateway' && !(step.next?.length)) {
                 const candidates = [];
                 for (let i = idx + 1; i < structure.steps.length && candidates.length < 2; i++) {
                     if (structure.steps[i].role === step.role) candidates.push(structure.steps[i].id);
                 }
-                if (!candidates.length) {
-                    for (let i = idx + 1; i < structure.steps.length && candidates.length < 2; i++) {
-                        candidates.push(structure.steps[i].id);
-                    }
-                }
+                if (!candidates.length) for (let i = idx + 1; i < structure.steps.length && candidates.length < 2; i++) candidates.push(structure.steps[i].id);
                 if (candidates.length) {
                     step.next = candidates;
                     if (!step.conditions) step.conditions = {};
                     candidates.forEach((id, i) => { if (!step.conditions[id]) step.conditions[id] = i === 0 ? 'Sí' : 'No'; });
-                    console.warn(`FIX4: gateway "${step.id}" sin salidas → ${candidates}`);
+                    console.warn(`FIX4: gateway ${step.id} → ${candidates}`);
                 }
             }
         });
 
-        // FIX 5: nodos huérfanos (sin incoming) en lanes > 0
-        // Regla: el flujo va izquierda→derecha dentro del lane, y SOLO baja
-        // al siguiente lane cuando el proceso continúa ahí.
-        // Si una sección termina → endEvent. Solo conectar hacia abajo si hay continuación.
-        //
-        // CASOS:
-        //   A) Lane tiene orphan intermediateEvent + un endEvent en el mismo lane
-        //      → el endEvent (terminal) se convierte en intermediate y conecta al orphan
-        //      → PATRÓN "Parte X.2": el flujo continúa dentro del mismo lane horizontal
-        //
-        //   B) Orphan es el PRIMER nodo del lane (intermediateEvent de inicio de módulo)
-        //      → intentar conectar desde hub del menú
-        //      → fallback: conectar desde último nodo no-endEvent del lane anterior
-        //
-        //   C) startEvent huérfano en lane > 0 → convertir a intermediateEvent primero
-        //
-        // NUNCA: convertir endEvent → userTask, ni crear conexiones cross-pool.
+        // FIX 5: nodos huérfanos
         {
-            const allTargets = new Set(structure.steps.flatMap(s => s.next || []));
-            // Hub de módulos: nodo con múltiples salidas (típicamente el menú)
-            const hub = structure.steps.find(s =>
-                s.type === 'intermediateEvent' && (s.next || []).length > 1
-            );
-
+            const hub = structure.steps.find(s => s.type === 'intermediateEvent' && (s.next || []).length > 1);
             structure.roles.forEach((role, ri) => {
-                if (ri === 0) return; // primer lane: startEvent no necesita incoming
-
+                if (ri === 0) return;
                 const laneSteps = structure.steps.filter(s => s.role === role);
                 if (!laneSteps.length) return;
-
-                // Recalcular allTargets en cada iteración (puede haber cambiado)
                 const currentTargets = new Set(structure.steps.flatMap(s => s.next || []));
-
-                // Encuentra todos los huérfanos del lane (no solo el primero)
                 const orphans = laneSteps.filter(s => !currentTargets.has(s.id));
-                if (!orphans.length) return;
-
                 orphans.forEach(orphan => {
-                    // Ya tiene incoming (puede haber sido conectado en iteración anterior)
                     const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
                     if (updatedTargets.has(orphan.id)) return;
-
-                    // Convertir startEvent huérfano a intermediateEvent
-                    if (orphan.type === 'startEvent') {
-                        orphan.type = 'intermediateEvent';
-                        console.warn(`FIX5: startEvent huérfano "${orphan.id}" → intermediateEvent`);
-                    }
-
-                    // CASO A: hay un endEvent en el mismo lane que no tiene salida
-                    // → ese endEvent debe convertirse en intermediate y conectar al orphan
-                    // (patrón "Parte X.2": flujo continúa en el mismo lane)
-                    const samelaneFinalizer = laneSteps.find(s =>
-                        s !== orphan &&
-                        s.type?.startsWith('endEvent') &&
-                        !(s.next || []).length &&
-                        !updatedTargets.has(orphan.id)
-                    );
+                    if (orphan.type === 'startEvent') { orphan.type = 'intermediateEvent'; console.warn(`FIX5: startEvent→intermediate ${orphan.id}`); }
+                    const samelaneFinalizer = laneSteps.find(s => s !== orphan && s.type?.startsWith('endEvent') && !(s.next || []).length && !updatedTargets.has(orphan.id));
                     if (samelaneFinalizer && orphan.type === 'intermediateEvent') {
-                        samelaneFinalizer.type = 'intermediateEvent';
-                        samelaneFinalizer.next = [orphan.id];
-                        console.warn(`FIX5A: "${samelaneFinalizer.id}" endEvent→intermediate, → "${orphan.id}" (Parte X.2)`);
-                        return;
+                        samelaneFinalizer.type = 'intermediateEvent'; samelaneFinalizer.next = [orphan.id];
+                        console.warn(`FIX5A: ${samelaneFinalizer.id}→${orphan.id}`); return;
                     }
-
-                    // CASO B: orphan es intermediateEvent de inicio de módulo
-                    // → conectar desde hub (menú)
                     if (hub && !hub.next.includes(orphan.id) && orphan.type === 'intermediateEvent') {
-                        hub.next.push(orphan.id);
-                        console.warn(`FIX5B: hub "${hub.id}" → "${orphan.id}"`);
-                        return;
+                        hub.next.push(orphan.id); console.warn(`FIX5B: hub→${orphan.id}`); return;
                     }
-
-                    // CASO C: fallback — conectar desde el último nodo no-endEvent del lane anterior
                     if (ri > 0) {
                         const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
                         const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
                         if (connector && !connector.next.includes(orphan.id)) {
-                            connector.next.push(orphan.id);
-                            console.warn(`FIX5C: "${connector.id}" → "${orphan.id}" (lane ${ri-1}→${ri})`);
+                            connector.next.push(orphan.id); console.warn(`FIX5C: ${connector.id}→${orphan.id}`);
                         }
                     }
                 });
             });
         }
 
-        // FIX 6: nodos sin salida (no-end, no-gateway) → conectar al siguiente en el lane
+        // FIX 6: nodos sin salida
         structure.steps.forEach((step, idx) => {
             if (step.type?.startsWith('endEvent') || step.type === 'exclusiveGateway') return;
             if ((step.next || []).length > 0) return;
             const nextInLane = structure.steps.slice(idx + 1).find(n => n.role === step.role);
-            if (nextInLane) {
-                step.next = [nextInLane.id];
-                console.warn(`FIX6: "${step.id}" sin salida → "${nextInLane.id}"`);
-                return;
-            }
-            // Último del lane sin endEvent → agregar uno
+            if (nextInLane) { step.next = [nextInLane.id]; console.warn(`FIX6: ${step.id}→${nextInLane.id}`); return; }
             const laneHasEnd = structure.steps.some(n => n.role === step.role && n.type?.startsWith('endEvent'));
             if (!laneHasEnd) {
                 const endId = `End_Auto_${step.id}`;
                 structure.steps.push({ id: endId, name: 'Fin', type: 'endEvent', role: step.role, next: [] });
-                step.next = [endId];
-                console.warn(`FIX6: endEvent auto "${endId}" para "${step.id}"`);
+                step.next = [endId]; console.warn(`FIX6: endEvent auto ${endId}`);
             }
         });
 
-        // FIX 7: limpiar lenguaje informal
-        const informalMap = [
-            [/^presionar?\s+/i,'Seleccionar '],[/^dar\s+clic\s+/i,'Seleccionar '],
-            [/^hacer?\s+clic\s+/i,'Seleccionar '],[/^pulsar?\s+/i,'Activar '],
-            [/^tocar?\s+/i,'Seleccionar '],[/clic/gi,''],[/botón/gi,'opción'],[/boton/gi,'opción'],
-        ];
-
-        // FIX 8: Evt_Volver* huérfanos — conectar desde endEvent del mismo lane.
+        // FIX 9: garantizar startEvent en cada pool definido por Gemini
+        // Funciona con cualquier número de pools (1, 2, 3, N)
         {
-            const allTargets8 = new Set(structure.steps.flatMap(s => s.next || []));
-            structure.steps.forEach(volver => {
-                if (!volver.id.toLowerCase().includes('volver')) return;
-                if (allTargets8.has(volver.id)) return;
-                const sameEnd = structure.steps.find(s =>
-                    s.role === volver.role && s.type?.startsWith('endEvent')
-                );
-                if (sameEnd) {
-                    console.warn(`FIX8: "${sameEnd.id}" → intermediateEvent → "${volver.id}"`);
-                    sameEnd.type = 'intermediateEvent';
-                    sameEnd.next = [volver.id];
-                    allTargets8.add(volver.id);
+            const poolDefs = structure.pools || null;
+            // Construir lista de grupos de roles por pool
+            const poolGroups = poolDefs
+                ? poolDefs.map(p => ({ name: p.name, roles: p.roles }))
+                : [{ name: null, roles: structure.roles }]; // fallback: todo en un pool
+
+            poolGroups.forEach(({ name, roles: poolRoles }) => {
+                const poolSteps = structure.steps.filter(s => poolRoles.includes(s.role));
+                if (!poolSteps.length) return;
+                if (poolSteps.some(s => s.type === 'startEvent')) return;
+                const poolIds = new Set(poolSteps.map(s => s.id));
+                const targets = new Set(poolSteps.flatMap(s => s.next || []).filter(id => poolIds.has(id)));
+                const firstNode = poolSteps.find(s => !targets.has(s.id)) || poolSteps[0];
+                if (firstNode && firstNode.type !== 'startEvent') {
+                    // Si ya hay un startEvent en este pool, promover a intermediateEvent (no startEvent)
+                    // Esto evita que FIX9 cree un startEvent en "Cerrar sesión" cuando el pool
+                    // ya tiene su startEvent correcto en "Inicio de sesión"
+                    const alreadyHasStart = poolSteps.some(s => s.type === 'startEvent');
+                    firstNode.type = alreadyHasStart ? 'intermediateEvent' : 'startEvent';
+                    structure.steps.forEach(s => {
+                        if (!poolRoles.includes(s.role) && (s.next || []).includes(firstNode.id)) {
+                            s.next = s.next.filter(n => n !== firstNode.id);
+                            console.warn(`FIX9: cross-pool eliminado: ${s.id}→${firstNode.id}`);
+                        }
+                    });
+                    console.warn(`FIX9: ${firstNode.id}→startEvent`);
                 }
             });
         }
 
-        // FIX 9: garantizar startEvent en CADA pool / proceso.
-        // Gemini frecuentemente genera el inicio de Brigadista (o cualquier segundo pool)
-        // como intermediateCatchEvent. Este fix actúa por pool:
-        //   – Detecta si hay startEvent en la primera lane del pool
-        //   – Si no: convierte el primer nodo (sin incoming) a startEvent
-        //   – Elimina cualquier incoming cross-pool hacia ese nodo
+        // FIX 10: eliminar intermediateEvents "relay" redundantes
+        // Un intermediateEvent con exactamente 1 entrada cross-lane y 1 salida es
+        // simplemente un conector de apariencia — no aporta información al diagrama.
+        // Lo eliminamos y conectamos directamente el nodo previo con el siguiente.
+        // EXCEPCIÓN: hubs (>1 salida), bridges de FIX0, y eventos con nombre informativo
         {
-            // Detectar pools: grupos de roles antes/después del splitIdx
-            // Para ser agnóstico del split, trabajamos sobre todos los roles agrupados
-            // por el prefijo "Ciudadano" / "Brigadista" — o simplemente el primer nodo
-            // sin incoming de CADA lane-0.
-            //
-            // Estrategia: para cada rol que es el primero de su "grupo" (rol index 0
-            // o primer rol después de splitIdx), asegurar que su primer nodo sea startEvent.
+            const bridgePattern = /^EvtBr_/;
+            let removed = true;
+            while (removed) {
+                removed = false;
+                const toRemove = new Set();
+                const stepMap = {};
+                structure.steps.forEach(s => { stepMap[s.id] = s; });
 
-            const poolBoundaries = [0];  // índices en allRoles donde empieza cada pool
-            // Detectar el splitIdx de forma anticipada (antes del split real más abajo)
-            for (let i = 1; i < structure.roles.length; i++) {
-                const hasBrig = structure.roles[i].toLowerCase().includes('brigadista');
-                const prevCiu = !structure.roles[i-1].toLowerCase().includes('brigadista');
-                if (hasBrig && prevCiu) { poolBoundaries.push(i); break; }
-            }
+                structure.steps.forEach(step => {
+                    if (step.type !== 'intermediateEvent' && step.type !== 'intermediateEventMessage') return;
+                    if (bridgePattern.test(step.id)) return; // FIX0 bridge — mantener
+                    const outs = step.next || [];
+                    if (outs.length !== 1) return; // hub o sin salida — mantener
+                    // Buscar todos los que apuntan a este evento
+                    const ins = structure.steps.filter(s => (s.next || []).includes(step.id));
+                    if (ins.length !== 1) return; // 0 o múltiples entradas — mantener
+                    const src = ins[0];
+                    const tgt = outs[0];
+                    // Solo eliminar si la entrada viene de un lane distinto (cross-lane relay)
+                    if (src.role === step.role) return; // misma lane — es un connector interno, mantener
+                    // Reconectar src → tgt directamente
+                    src.next = src.next.map(n => n === step.id ? tgt : n);
+                    // Transferir condición si existe
+                    if (src.conditions?.[step.id]) {
+                        src.conditions[tgt] = src.conditions[tgt] || src.conditions[step.id];
+                        delete src.conditions[step.id];
+                    }
+                    toRemove.add(step.id);
+                    console.warn(`FIX10: relay eliminado ${step.id} ("${step.name}") ${src.id}→${tgt}`);
+                    removed = true;
+                });
 
-            poolBoundaries.forEach(boundary => {
-                const firstRole = structure.roles[boundary];
-                if (!firstRole) return;
-                const poolRoles = structure.roles.slice(boundary,
-                    poolBoundaries[poolBoundaries.indexOf(boundary)+1] ?? structure.roles.length);
-                const poolSteps = structure.steps.filter(s => poolRoles.includes(s.role));
-                const hasStart  = poolSteps.some(s => s.type === 'startEvent');
-
-                if (!hasStart) {
-                    // Encontrar el primer nodo del pool que no tiene incoming DENTRO del pool
-                    const poolIds  = new Set(poolSteps.map(s => s.id));
-                    const targets  = new Set(poolSteps.flatMap(s => s.next || []).filter(id => poolIds.has(id)));
-                    const orphan   = poolSteps.find(s => !targets.has(s.id));
-                    const firstNode = orphan || poolSteps[0];
-
-                    if (firstNode && firstNode.type !== 'startEvent') {
-                        console.warn(`FIX9: "${firstNode.id}" (${firstNode.type}) → startEvent (pool boundary ${boundary})`);
-                        firstNode.type = 'startEvent';
-                        // Eliminar incoming cross-pool hacia este nodo
-                        structure.steps.forEach(s => {
-                            if (!poolRoles.includes(s.role) && (s.next || []).includes(firstNode.id)) {
-                                s.next = s.next.filter(n => n !== firstNode.id);
-                                console.warn(`FIX9: cross-pool eliminado: "${s.id}" → "${firstNode.id}"`);
-                            }
+                if (toRemove.size) {
+                    structure.steps = structure.steps.filter(s => !toRemove.has(s.id));
+                    structure.roles = structure.roles.filter(r =>
+                        structure.steps.some(s => s.role === r)
+                    );
+                    // Actualizar pools también
+                    if (structure.pools) {
+                        structure.pools.forEach(pool => {
+                            pool.roles = pool.roles.filter(r => structure.steps.some(s => s.role === r));
                         });
-                        // Si era intermediateEvent/intermediateCatchEvent, limpiar incoming dentro del pool también
-                        // (el startEvent no debe tener incoming)
                     }
                 }
-            });
-        }
-
-        // ── Split roles into two pools: Ciudadano and Brigadista ──────────────
-        // Detect the split point: first lane with "brigadista" that follows
-        // one or more "ciudadano" lanes. Each pool gets its own process and DI.
-        const allRoles  = structure.roles;
-        const allSteps  = structure.steps;
-        const splitIdx  = (() => {
-            for (let i = 1; i < allRoles.length; i++) {
-                const hasBrig = allRoles[i].toLowerCase().includes('brigadista');
-                const prevCiu = allRoles[i-1].toLowerCase().includes('ciudadano') ||
-                                !allRoles[i-1].toLowerCase().includes('brigadista');
-                if (hasBrig && prevCiu) return i;
             }
-            return -1;  // no split found → single pool
-        })();
-
-        const processId  = `Process_${Date.now()}`;
-        const processId2 = `Process_${Date.now() + 1}`;
-
-        let logicXml, diXml, collaborationXml, finalXml;
-        console.log('⚙️  Generando XML...');
-
-        if (splitIdx > 0) {
-            // Dos pools: Ciudadano arriba, Brigadista abajo — UN solo archivo BPMN.
-            const roles1  = allRoles.slice(0, splitIdx);
-            const roles2  = allRoles.slice(splitIdx);
-            const steps1  = allSteps.filter(s => roles1.includes(s.role));
-            const steps2  = allSteps.filter(s => roles2.includes(s.role));
-            const struct1 = { roles: roles1, steps: steps1 };
-            const struct2 = { roles: roles2, steps: steps2 };
-
-            const cleanPoolName1 = roles1.some(r => r.toLowerCase().includes('ciudadano'))  ? 'Portal Ciudadano'       : 'Proceso Ciudadano';
-            const cleanPoolName2 = roles2.some(r => r.toLowerCase().includes('brigadista')) ? 'Herramienta Brigadista' : 'Proceso Brigadista';
-
-            try {
-                logicXml = generateLogic(struct1, processId, '') + '\n' + generateLogic(struct2, processId2, 'B');
-            } catch (e) { throw new Error(`Error en generateLogic: ${e.message}`); }
-
-            let di1, di2;
-            try {
-                di1 = generateDI(struct1, processId,  { poolY: 60,                  poolId: 'Participant_1', poolName: cleanPoolName1 });
-                di2 = generateDI(struct2, processId2, { poolY: 60 + di1.poolH + 60, poolId: 'Participant_2', poolName: cleanPoolName2 });
-                diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
-    <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
-${di1.shapesXml}${di2.shapesXml}${di1.edgesXml}${di2.edgesXml}    </bpmndi:BPMNPlane>
-  </bpmndi:BPMNDiagram>`;
-            } catch (e) { throw new Error(`Error en generateDI: ${e.message}`); }
-
-            collaborationXml = `  <collaboration id="Collaboration_1">
-    <participant id="Participant_1" name="${xmlEscape(cleanPoolName1)}" processRef="${processId}"/>
-    <participant id="Participant_2" name="${xmlEscape(cleanPoolName2)}" processRef="${processId2}"/>
-  </collaboration>`;
-
-            console.log(`✓ Pool 1: "${cleanPoolName1}" — ${steps1.length} pasos`);
-            console.log(`✓ Pool 2: "${cleanPoolName2}" — ${steps2.length} pasos`);
-        } else {
-            // Pool único
-            try { logicXml = generateLogic(structure, processId); }
-            catch (e) { throw new Error(`Error en generateLogic: ${e.message}`); }
-            try {
-                const di = generateDI(structure, processId, { poolY: 60, poolId: 'Participant_1', poolName: 'Proceso de Negocio' });
-                diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
-    <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
-${di.shapesXml}${di.edgesXml}    </bpmndi:BPMNPlane>
-  </bpmndi:BPMNDiagram>`;
-            } catch (e) { throw new Error(`Error en generateDI: ${e.message}`); }
-            collaborationXml = `  <collaboration id="Collaboration_1">
-    <participant id="Participant_1" name="Proceso de Negocio" processRef="${processId}"/>
-  </collaboration>`;
         }
 
-        finalXml = `<?xml version="1.0" encoding="utf-8"?>
+        // ─── ENSAMBLADO GENÉRICO DE N POOLS ──────────────────────────────────────
+        // Si Gemini devolvió pools[] → usamos esa definición directamente.
+        // Si no → todo en un solo pool (compatibilidad hacia atrás).
+        {
+            const allSteps = structure.steps;
+            const ts = Date.now();
+
+            // Construir definición de pools
+            let poolDefs;
+            if (structure.pools?.length) {
+                // Normalizar: asegurarse que cada role mencionado en steps esté en algún pool
+                const assignedRoles = new Set(structure.pools.flatMap(p => p.roles));
+                const unassigned = structure.roles.filter(r => !assignedRoles.has(r));
+                if (unassigned.length) {
+                    // Agregar roles huérfanos al último pool
+                    structure.pools[structure.pools.length - 1].roles.push(...unassigned);
+                    console.warn(`FIX: ${unassigned.length} roles sin pool → agregados al último`);
+                }
+                poolDefs = structure.pools;
+            } else {
+                // Fallback: todo en un pool genérico
+                poolDefs = [{ name: 'Proceso de Negocio', roles: structure.roles }];
+            }
+
+            // Generar un processId y lane prefix por pool
+            const poolConfigs = poolDefs.map((pool, i) => ({
+                name:      pool.name || `Proceso ${i + 1}`,
+                roles:     pool.roles,
+                steps:     allSteps.filter(s => pool.roles.includes(s.role)),
+                processId: `Process_${ts + i}`,
+                poolId:    `Participant_${i + 1}`,
+                lanePrefix: i === 0 ? '' : String.fromCharCode(65 + i - 1), // '', 'A', 'B', 'C'...
+            }));
+
+            // Generar XML de lógica (procesos BPMN) para cada pool
+            const logicXml = poolConfigs
+                .map(pc => generateLogic({ roles: pc.roles, steps: pc.steps }, pc.processId, pc.lanePrefix))
+                .join('\n');
+
+            // Generar DI (shapes + edges) apilando pools verticalmente
+            let currentY = 60;
+            const diParts = [];
+            poolConfigs.forEach(pc => {
+                const di = generateDI(
+                    { roles: pc.roles, steps: pc.steps },
+                    pc.processId,
+                    { poolY: currentY, poolId: pc.poolId, poolName: pc.name, lanePrefix: pc.lanePrefix }
+                );
+                diParts.push(di);
+                currentY += di.poolH + 60; // 60px gap entre pools
+            });
+
+            const allShapes = diParts.map(d => d.shapesXml).join('');
+            const allEdges  = diParts.map(d => d.edgesXml).join('');
+
+            const diXml = `  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Proceso de Negocio">
+    <bpmndi:BPMNPlane id="BPMNDiagram_1_Plane" bpmnElement="Collaboration_1">
+${allShapes}${allEdges}    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>`;
+
+            const participantsXml = poolConfigs
+                .map(pc => `    <participant id="${pc.poolId}" name="${xmlEscape(pc.name)}" processRef="${pc.processId}"/>`)
+                .join('\n');
+
+            const collaborationXml = `  <collaboration id="Collaboration_1">\n${participantsXml}\n  </collaboration>`;
+
+            const finalXml = `<?xml version="1.0" encoding="utf-8"?>
 <definitions
   xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -1305,13 +1153,17 @@ ${logicXml}
 ${diXml}
 </definitions>`;
 
-        console.log(`✓ BPMN generado — ${allSteps.length} pasos, ${allRoles.length} roles`);
-        res.json({
-            success: true,
-            data:    mdMatch ? mdMatch[1].trim() : 'Análisis completado.',
-            bpmn:    finalXml,
-            bpmns:   [{ name: 'Proceso de Negocio', bpmn: finalXml }],
-        });
+            poolConfigs.forEach(pc =>
+                console.log(`✓ Pool "${pc.name}": ${pc.steps.length} pasos, ${pc.roles.length} lanes`)
+            );
+            console.log(`✓ BPMN generado — ${allSteps.length} pasos totales, ${poolDefs.length} pool(s)`);
+            res.json({
+                success: true,
+                data:    mdMatch ? mdMatch[1].trim() : 'Análisis completado.',
+                bpmn:    finalXml,
+                bpmns:   [{ name: 'Proceso de Negocio', bpmn: finalXml }]
+            });
+        }
 
     } catch (error) {
         console.error('Error crítico:', error.message);
@@ -1319,188 +1171,6 @@ ${diXml}
     }
 });
 
-// ============================================================
-// 7. SERVIDOR
-// ============================================================
-const server = app.listen(4000, () =>
-    console.log(`Servidor IA en puerto 4000 — modelo: ${CONFIG.model}`)
-);
-server.timeout          = CONFIG.timeout;
+const server = app.listen(4000, () => console.log(`Servidor IA en puerto 4000 — modelo: ${CONFIG.model}`));
+server.timeout = CONFIG.timeout;
 server.keepAliveTimeout = CONFIG.timeout;
-// ============================================================
-// 8. ENDPOINT DE DIAGNÓSTICO — /debug
-// Procesa el PDF igual que /analyze pero devuelve texto plano
-// describiendo qué sistemas detectó y qué estructura generaría,
-// sin construir ningún XML. Útil para verificar el output de Gemini.
-// ============================================================
-app.post('/debug', (req, res, next) => {
-    upload.single('file')(req, res, (err) => {
-        if (err) return multerErrorHandler(err, req, res, next);
-        next();
-    });
-}, async (req, res) => {
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-
-    try {
-        if (!req.file) return res.status(400).send('ERROR: Archivo no recibido.');
-
-        let pdfData;
-        try {
-            pdfData = await pdf(req.file.buffer, { max: 0 });
-        } catch (pdfErr) {
-            return res.status(400).send(`ERROR: No se pudo leer el PDF — ${pdfErr.message}`);
-        }
-
-        const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
-        const manualText = rawText.substring(0, CONFIG.maxPdfChars);
-        if (manualText.length < 100) return res.status(400).send('ERROR: PDF sin texto extraíble (posiblemente escaneado).');
-
-        const lines = [];
-        const log = (...args) => { const msg = args.join(' '); console.log(msg); lines.push(msg); };
-
-        log('═══════════════════════════════════════════════');
-        log('DIAGNÓSTICO DE PROCESAMIENTO');
-        log('═══════════════════════════════════════════════');
-        log(`PDF leído: ${manualText.length} chars`);
-        log(`Primeros 300 chars del texto extraído:`);
-        log(manualText.substring(0, 300));
-        log('───────────────────────────────────────────────');
-
-        const model = genAI.getGenerativeModel({
-            model: CONFIG.model,
-            generationConfig: { temperature: CONFIG.temperature, maxOutputTokens: CONFIG.maxTokens },
-        });
-
-        async function callWithRetry(prompt, maxRetries = 3) {
-            for (let attempt = 0; attempt < maxRetries; attempt++) {
-                try {
-                    const r = await model.generateContent(prompt);
-                    return r.response.text();
-                } catch(e) {
-                    const msg = e.message || '';
-                    const retry = (msg.includes('503') || msg.includes('429')) && attempt < maxRetries - 1;
-                    if (retry) {
-                        const wait = (attempt + 1) * 15000;
-                        log(`Gemini saturado — esperando ${wait/1000}s...`);
-                        await new Promise(r => setTimeout(r, wait));
-                    } else throw e;
-                }
-            }
-        }
-
-        // ── PASO 1: Detectar sistemas ────────────────────────
-        log('\nPASO 1 — DETECCIÓN DE SISTEMAS');
-        log('Enviando prompt de detección a Gemini...');
-
-        const detectPrompt = buildPromptDetect(manualText);
-        log(`Tamaño del prompt de detección: ${detectPrompt.length} chars`);
-
-        const detectRaw = await callWithRetry(detectPrompt);
-        log(`\nRespuesta RAW de Gemini (detección completa):`);
-        log('---');
-        log(detectRaw);
-        log('---');
-
-        // Parsear
-        let sistemas = null;
-        const intentos = [
-            detectRaw,
-            detectRaw.replace(/```json|```/gi, '').trim(),
-            detectRaw.substring(detectRaw.indexOf('{'), detectRaw.lastIndexOf('}') + 1),
-        ];
-        for (const intento of intentos) {
-            try {
-                const parsed = JSON.parse(intento);
-                const arr = parsed.sistemas || parsed.actores || parsed.systems;
-                if (Array.isArray(arr) && arr.length > 0) { sistemas = arr; break; }
-            } catch(e) { /* continuar */ }
-        }
-
-        if (!sistemas) {
-            log('\n⚠ PARSE FALLÓ — no se pudo extraer array de sistemas del JSON');
-            log('Usando sistema genérico de fallback');
-            sistemas = [{ nombre: 'Sistema Principal', descripcion: 'Flujo principal del manual' }];
-        } else {
-            log(`\n✓ Sistemas parseados correctamente: ${sistemas.length}`);
-        }
-
-        log(`\nSISTEMAS DETECTADOS (${sistemas.length}):`);
-        sistemas.forEach((s, i) => log(`  ${i+1}. "${s.nombre}" — ${s.descripcion}`));
-
-        // ── PASO 2: Por cada sistema, pedir solo el JSON de estructura ──
-        log('\n═══════════════════════════════════════════════');
-        log('PASO 2 — ESTRUCTURA DE CADA DIAGRAMA');
-        log('═══════════════════════════════════════════════');
-
-        for (let i = 0; i < sistemas.length; i++) {
-            const sistema = sistemas[i];
-            const otros   = sistemas.filter((_, j) => j !== i).map(s => s.nombre);
-            log(`\n── Diagrama ${i+1}: "${sistema.nombre}" ──`);
-
-            try {
-                const raw = await callWithRetry(buildPromptDiagram(manualText, sistema.nombre, sistema.descripcion || '', otros));
-
-                // Intentar parsear para mostrar resumen
-                let estructura = null;
-                try {
-                    let js = raw.replace(/```json|```/g,'').trim();
-                    js = js.replace(/,\s*([}\]])/g,'$1');
-                    estructura = JSON.parse(js);
-                } catch(e) {
-                    // Intentar extraer JSON del medio del texto
-                    const start = raw.indexOf('{');
-                    const end   = raw.lastIndexOf('}');
-                    if (start >= 0 && end > start) {
-                        try { estructura = JSON.parse(raw.substring(start, end+1)); } catch(_) {}
-                    }
-                }
-
-                if (estructura) {
-                    log(`  ✓ JSON parseado correctamente`);
-                    log(`  name: "${estructura.name}"`);
-                    log(`  roles (${estructura.roles?.length ?? 0}): ${(estructura.roles || []).join(' | ')}`);
-                    log(`  steps total: ${estructura.steps?.length ?? 0}`);
-
-                    // Contar nodos por tipo
-                    const byType = {};
-                    (estructura.steps || []).forEach(s => { byType[s.type] = (byType[s.type]||0)+1; });
-                    log(`  tipos: ${JSON.stringify(byType)}`);
-
-                    // Contar nodos por rol
-                    const byRole = {};
-                    (estructura.roles || []).forEach(r => { byRole[r] = 0; });
-                    (estructura.steps || []).forEach(s => { if (byRole[s.role] !== undefined) byRole[s.role]++; });
-                    log(`  por rol:`);
-                    Object.entries(byRole).forEach(([r, n]) => log(`    • ${r}: ${n} nodos`));
-
-                    // Verificar integridad básica
-                    const ids = new Set((estructura.steps||[]).map(s => s.id));
-                    let broken = 0;
-                    (estructura.steps||[]).forEach(s => {
-                        (s.next||[]).forEach(nid => { if (!ids.has(nid)) broken++; });
-                    });
-                    const noNext = (estructura.steps||[]).filter(s =>
-                        !s.type?.startsWith('endEvent') && !(s.next?.length > 0)
-                    ).length;
-                    log(`  referencias rotas: ${broken}`);
-                    log(`  nodos sin next[]: ${noNext}`);
-                } else {
-                    log(`  ✗ JSON NO pudo parsearse`);
-                    log(`  Respuesta RAW (primeros 500 chars):`);
-                    log(raw.substring(0, 500));
-                }
-            } catch(e) {
-                log(`  ✗ ERROR llamando Gemini: ${e.message}`);
-            }
-        }
-
-        log('\n═══════════════════════════════════════════════');
-        log('FIN DEL DIAGNÓSTICO');
-        log('═══════════════════════════════════════════════');
-
-        res.send(lines.join('\n'));
-
-    } catch(error) {
-        res.status(500).send(`ERROR CRÍTICO: ${error.message}\n${error.stack}`);
-    }
-});
