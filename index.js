@@ -29,7 +29,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CONFIG = {
     model:       'gemini-2.5-flash',
-    maxPdfChars: 120_000,
+    maxPdfChars: 280_000,   // subido de 120k — gemini-2.5-flash soporta ~200k tokens de contexto
     maxTokens:   65_536,
     temperature: 0,
     timeout:     180_000,
@@ -310,6 +310,12 @@ function generateDI(structure, processId, poolOpts = {}) {
     });
 
     // ── PASO 4: Alturas de lane y posición Y ───────────────────────────────
+    // La altura se calcula con ROW_REF_H (60px) para que sea consistente con el CY fijo.
+    // Fórmula: padTop + (rows-1)*ROW_H + ROW_REF_H + padBot
+    // 1 fila: 75 + 0 + 60 + 65 = 200 → max(260, 200) = 260px
+    // 2 filas: 75 + 135 + 60 + 65 = 335px
+    // 3 filas: 75 + 270 + 60 + 65 = 470px
+    const ROW_REF_H = 60;  // definida aquí, también usada en PASO 5
     const laneRowCount = {};
     roles.forEach(role => {
         const laneSteps = steps.filter(s => s.role === role);
@@ -323,7 +329,7 @@ function generateDI(structure, processId, poolOpts = {}) {
 
     roles.forEach((role, ri) => {
         const rows = laneRowCount[role] || 1;
-        const h = LANE_PAD_TOP + (rows - 1) * ROW_H + sz('userTask').h + LANE_PAD_BOT;
+        const h = LANE_PAD_TOP + (rows - 1) * ROW_H + ROW_REF_H + LANE_PAD_BOT;
         laneH[ri] = Math.max(LANE_MIN_H, h);
         laneY[ri] = curY;
         curY += laneH[ri];
@@ -331,6 +337,9 @@ function generateDI(structure, processId, poolOpts = {}) {
     const poolH = curY - POOL_Y;
 
     // ── PASO 5: Posiciones pixel de cada nodo ─────────────────────────────
+    // IMPORTANTE: el CY de cada fila es FIJO e independiente del tamaño del nodo.
+    // Sin esto, startEvent (h=36), gateway (h=44) y task (h=60) en la misma fila
+    // obtendrían CY distintos (153, 157, 165) causando desalineación y flechas torcidas.
     const pos = {};
     steps.forEach(s => {
         const { w, h } = sz(s.type);
@@ -339,10 +348,11 @@ function generateDI(structure, processId, poolOpts = {}) {
         const col = nodeCol[s.id] ?? 0;
         const row = nodeRow[s.id] ?? 0;
         const cx  = colCX[`${s.role}__${col}`] ?? (LANE_X + LANE_LEFT_PAD + col * 200);
-        const cy  = laneY[ri] + LANE_PAD_TOP + (h / 2) + row * ROW_H;
+        // CY fijo por fila: todos los nodos de row=N comparten el mismo centro Y
+        const cy  = laneY[ri] + LANE_PAD_TOP + ROW_REF_H / 2 + row * ROW_H;
         pos[s.id] = {
             x:  Math.round(cx - w / 2),
-            y:  Math.round(cy - h / 2),
+            y:  Math.round(cy - h / 2),   // centrado verticalmente sobre el CY de la fila
             w, h,
             cx: Math.round(cx),
             cy: Math.round(cy),
@@ -520,6 +530,18 @@ function buildPrompt(text) {
     return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
 
 ═══════════════════════════════════════════════════════════
+PASO PREVIO OBLIGATORIO — ANTES DE ESCRIBIR CUALQUIER COSA
+═══════════════════════════════════════════════════════════
+Antes de escribir el [MD_START] o el [JSON_START], haz lo siguiente:
+
+1. Lee el manual COMPLETO de principio a fin, sin saltarte ninguna sección.
+2. Enumera mentalmente TODOS los módulos, secciones y actores encontrados.
+3. Verifica que cada módulo esté representado como mínimo por un lane en el JSON.
+4. Presta especial atención a los módulos del FINAL del manual — son igual de
+   importantes que los del inicio y no deben omitirse ni fusionarse por comodidad.
+5. Solo cuando tengas el inventario completo, comienza a escribir la respuesta.
+
+═══════════════════════════════════════════════════════════
 FILOSOFÍA: MENOS ES MÁS
 ═══════════════════════════════════════════════════════════
 El diagrama debe comunicar el PROPÓSITO de cada sección, no documentar cada clic de la interfaz.
@@ -571,6 +593,20 @@ CUÁNDO crear múltiples pools:
   • El manual tiene capítulos que son procesos separados aunque usen el mismo sistema
   → Un pool por cada actor o proceso independiente. Sin límite — puede ser 1, 2, 3, 4 o más.
 
+  REGLA CLAVE — pool vs lane:
+  Un POOL nuevo solo se justifica cuando hay un LOGIN DIFERENTE o un USUARIO DIFERENTE.
+  Si varios módulos comparten el mismo login/menú → son LANES del mismo pool, no pools distintos.
+
+  Ejemplo CORRECTO para manual SICSSE (Altas + Bajas, mismo sistema, mismo login):
+    Pool 1 "SICSSE - Altas": login + Alta Compras Mayores + Alta Compras Menores + ... + logout
+    Pool 2 "SICSSE - Bajas": login + Baja por Desuso + Baja por Siniestro + logout
+    → 2 pools porque Altas y Bajas son procesos claramente separados en el manual.
+
+  Ejemplo INCORRECTO (sobre-fragmentación):
+    Pool 1 "Alta Compras Mayores" (con su propio login)
+    Pool 2 "Alta Compras Menores" (con su propio login)  ← INCORRECTO: mismo login
+    → Estos son LANES de un mismo pool "SICSSE - Altas", no pools distintos.
+
 CUÁNDO crear un solo pool:
   • Solo hay un actor usando el sistema
   • Todas las secciones son módulos del mismo menú del mismo usuario
@@ -604,6 +640,12 @@ LANE DE CIERRE — reglas especiales:
   • Ejemplo: Evt_CerrarSesion → Task_ConfirmarCierre → End_Sesion
 
 Cada pool tiene su propio startEvent. NUNCA conectar nodos entre pools distintos.
+
+SUB-FASES DE MÓDULOS:
+  Cuando un módulo describe etapas claramente diferenciadas en el manual
+  (Registro, Seguimiento, Documentos, Aprobación, Envío SAJ…), cada etapa
+  con pasos propios merece su propio lane.
+  Si la etapa tiene solo 1-2 pasos genéricos, consérvala unida al lane principal.
 
 ═══════════════════════════════════════════════════════════
 REGLA 3 — CANTIDAD DE NODOS POR LANE (LÍMITE ESTRICTO)
@@ -714,6 +756,25 @@ Cuando el manual describe muchos módulos similares (Alta, Baja, Modificación, 
    - Notificaciones externas (endEventMessage)
 
 ═══════════════════════════════════════════════════════════
+REGLA 8 — JSON COMPACTO (OBLIGATORIO)
+═══════════════════════════════════════════════════════════
+Para evitar que la respuesta se trunque en manuales grandes, escribe cada step
+en UNA SOLA LÍNEA. Esto reduce el tamaño del JSON un 35-40% sin perder datos.
+
+  ✅ CORRECTO — una línea por step:
+  {"id":"Start_A","name":"Inicio","type":"startEvent","role":"Login","next":["Task_B"]}
+
+  ❌ INCORRECTO — múltiples líneas por step:
+  {
+    "id": "Start_A",
+    "name": "Inicio",
+    ...
+  }
+
+Aplica este formato a TODOS los steps sin excepción.
+El campo "pools" puede seguir con formato normal (son pocos elementos).
+
+═══════════════════════════════════════════════════════════
 EJEMPLO REAL basado en un diagrama profesional de referencia
 ═══════════════════════════════════════════════════════════
 Este ejemplo muestra el nivel de concisión y estructura esperados:
@@ -822,10 +883,10 @@ app.post('/analyze', (req, res, next) => {
                     geminiFileUri = fileData.file?.uri;
                     console.log(`✓ PDF subido a File API: ${geminiFileUri}`);
                 } else {
-                    console.warn(`File API falló (${uploadRes.status}) — usando texto extraído`);
+                    console.error(`⚠️  File API falló (${uploadRes.status}) — el manual será truncado a ${CONFIG.maxPdfChars} chars. El diagrama puede omitir módulos del final.`);
                 }
             } catch (e) {
-                console.warn(`File API error: ${e.message} — usando texto extraído`);
+                console.error(`⚠️  File API error: ${e.message} — el manual será truncado a ${CONFIG.maxPdfChars} chars. El diagrama puede omitir módulos del final.`);
             }
         }
 
