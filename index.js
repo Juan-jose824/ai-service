@@ -44,59 +44,11 @@ function xmlEscape(str) {
         .replace(/'/g,  '&apos;');
 }
 
-function assignColumns(steps) {
-    const stepMap = {}, nodeColumn = {};
-    steps.forEach(s => { stepMap[s.id] = s; });
-    const inDegree = {};
-    steps.forEach(s => { inDegree[s.id] = 0; });
-    steps.forEach(s => { (s.next || []).forEach(nid => { if (inDegree[nid] !== undefined) inDegree[nid]++; }); });
-    const queue = steps.filter(s => inDegree[s.id] === 0).map(s => s.id);
-    if (queue.length === 0 && steps.length > 0) queue.push(steps[0].id);
-    const processed = new Set();
-    steps.forEach(s => { nodeColumn[s.id] = 0; });
-    while (queue.length > 0) {
-        const id = queue.shift();
-        if (processed.has(id)) continue;
-        processed.add(id);
-        const step = stepMap[id];
-        if (step && step.next) {
-            step.next.forEach(nextId => {
-                if (!nextId || nextId === id) return;
-                const newCol = (nodeColumn[id] || 0) + 1;
-                if (newCol > (nodeColumn[nextId] || 0)) nodeColumn[nextId] = newCol;
-                if (!processed.has(nextId)) queue.push(nextId);
-            });
-        }
-    }
-    return nodeColumn;
-}
-
-function assignRows(steps, nodeColumn, roles) {
-    const laneColCount = {}, nodeRow = {};
-    const sorted = [...steps].sort((a, b) => (nodeColumn[a.id] || 0) - (nodeColumn[b.id] || 0));
-    sorted.forEach(step => {
-        const roleIdx = roles.indexOf(step.role);
-        const col = nodeColumn[step.id] || 0;
-        const key = `${roleIdx}_${col}`;
-        if (laneColCount[key] === undefined) laneColCount[key] = 0;
-        nodeRow[step.id] = laneColCount[key];
-        laneColCount[key]++;
-    });
-    const maxRowPerLane = {};
-    roles.forEach((_, i) => { maxRowPerLane[i] = 0; });
-    steps.forEach(step => {
-        const roleIdx = roles.indexOf(step.role);
-        const row = nodeRow[step.id] || 0;
-        if (row + 1 > maxRowPerLane[roleIdx]) maxRowPerLane[roleIdx] = row + 1;
-    });
-    return { nodeRow, maxRowPerLane };
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// generateLogic — sin cambios
+// ─────────────────────────────────────────────────────────────────────────────
 function generateLogic(structure, processId, lanePrefix = '') {
     const { roles, steps } = structure;
-
-    // Cada pool recibe un prefijo único para sus IDs de nodos y flows.
-    // Esto evita colisiones cuando múltiples pools comparten IDs como "Start_Login".
     const pfx = lanePrefix === '' ? 'p0_' : `p${lanePrefix}_`;
     const pid  = id => `${pfx}${id}`;
     const fid  = (s, t) => `Flow_${pfx}${s}_${pfx}${t}`;
@@ -155,149 +107,268 @@ ${sequences}
   </process>`;
 }
 
-
+// ─────────────────────────────────────────────────────────────────────────────
+// generateDI — versión 2.0 (layout profesional)
+//
+// PRINCIPIOS del diagrama de referencia profesional:
+//  1. Nodos pequeños (start/end/intermediate/gateway) tienen tamaño reducido
+//  2. El espaciado horizontal es moderado (~180-220px center-to-center entre tasks)
+//  3. Las salidas de gateways se distribuyen VERTICALMENTE dentro del lane
+//  4. Las flechas cross-lane salen por ABAJO del nodo fuente y entran por ARRIBA
+//  5. El ancho del pool se calcula en base al contenido real
+//  6. La altura de cada lane se calcula en base a las filas necesarias
+// ─────────────────────────────────────────────────────────────────────────────
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
-    const POOL_ID   = poolOpts.poolId    ?? 'Participant_1';
-    const POOL_Y    = poolOpts.poolY     ?? 60;
-    const LANE_PFX  = poolOpts.lanePrefix ?? '';
-    // ID prefix must match generateLogic — same formula
-    const NODE_PFX  = LANE_PFX === '' ? 'p0_' : `p${LANE_PFX}_`;
-    const npid      = id => `${NODE_PFX}${id}`;
-    const nfid      = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
+    const POOL_ID    = poolOpts.poolId    ?? 'Participant_1';
+    const POOL_Y     = poolOpts.poolY     ?? 60;
+    const LANE_PFX   = poolOpts.lanePrefix ?? '';
+    const NODE_PFX   = LANE_PFX === '' ? 'p0_' : `p${LANE_PFX}_`;
+    const npid       = id => `${NODE_PFX}${id}`;
+    const nfid       = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
 
+    // ── Tamaños de nodos ────────────────────────────────────────────────────
     const NODE_SIZE = {
-        startEvent:               { w: 36,  h: 36 },
-        endEvent:                 { w: 36,  h: 36 },
-        endEventMessage:          { w: 36,  h: 36 },
-        exclusiveGateway:         { w: 50,  h: 50 },
-        parallelGateway:          { w: 50,  h: 50 },
-        task:                     { w: 120, h: 80 },
-        userTask:                 { w: 120, h: 80 },
-        serviceTask:              { w: 120, h: 80 },
-        scriptTask:               { w: 120, h: 80 },
-        intermediateEvent:        { w: 36,  h: 36 },
-        intermediateEventMessage: { w: 36,  h: 36 },
+        startEvent:               { w: 36,  h: 36  },
+        endEvent:                 { w: 36,  h: 36  },
+        endEventMessage:          { w: 36,  h: 36  },
+        exclusiveGateway:         { w: 44,  h: 44  },
+        parallelGateway:          { w: 44,  h: 44  },
+        task:                     { w: 110, h: 60  },
+        userTask:                 { w: 110, h: 60  },
+        serviceTask:              { w: 110, h: 60  },
+        scriptTask:               { w: 110, h: 60  },
+        intermediateEvent:        { w: 36,  h: 36  },
+        intermediateEventMessage: { w: 36,  h: 36  },
     };
-    const sz = type => NODE_SIZE[type] || NODE_SIZE.task;
+    const sz       = type => NODE_SIZE[type] || NODE_SIZE.task;
+    const isSmall  = type => ['startEvent','endEvent','endEventMessage',
+                              'intermediateEvent','intermediateEventMessage'].includes(type);
+    const isGW     = type => type?.includes('Gateway');
+    const isTask   = type => !isSmall(type) && !isGW(type);
 
-    // ── Layout constants ─────────────────────────────────────────────────────
-    // COL_W 320: gap visible entre tareas = 320-120 = 200px — espacioso y profesional
-    // LANE_H 420: altura cómoda, nodos centrados con buen margen vertical
-    const POOL_X   = 160;
-    const LABEL_W  = 30;
-    const LANE_X   = POOL_X + LABEL_W;      // 190
-    const LANE_H   = 420;                   // altura lane fila simple
-    const LANE_H_2 = 840;                   // altura lane doble fila
-    const COL_W    = 320;                   // centro a centro — gap visual = 320-120 = 200px
-    const MAX_COLS = 7;
-    const COL0_CX  = LANE_X + 160;         // cx columna 0
-    const HW_STEP  = 25;
+    // ── Constantes de espaciado horizontal center-to-center ─────────────────
+    // Basado en mediciones del diagrama profesional de referencia
+    const H_GAP = {
+        'small→small': 140,
+        'small→task' : 160,
+        'small→gw'   : 150,
+        'task→small' : 130,
+        'task→task'  : 205,
+        'task→gw'    : 165,
+        'gw→task'    : 165,
+        'gw→small'   : 130,
+        'gw→gw'      : 150,
+    };
+    const getHGap = (srcType, dstType) => {
+        const sKey = isSmall(srcType) ? 'small' : (isGW(srcType) ? 'gw' : 'task');
+        const dKey = isSmall(dstType) ? 'small' : (isGW(dstType) ? 'gw' : 'task');
+        return H_GAP[`${sKey}→${dKey}`] ?? 190;
+    };
 
+    // ── Constantes de layout vertical ──────────────────────────────────────
+    const ROW_H         = 135;   // px entre centros de fila dentro de un lane
+    const LANE_PAD_TOP  = 75;    // margen superior dentro del lane
+    const LANE_PAD_BOT  = 65;    // margen inferior dentro del lane
+    const LANE_MIN_H    = 260;   // altura mínima de cualquier lane
+    const POOL_X        = 160;
+    const LABEL_W       = 30;
+    const LANE_X        = POOL_X + LABEL_W;   // 190
+    const LANE_LEFT_PAD = 85;    // padding izquierdo desde el borde del lane al primer cx
+
+    // ── Mapa de pasos ───────────────────────────────────────────────────────
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // Topological sort per lane
-    const laneOrder = {};
+    // ── PASO 1: Asignar columnas por BFS dentro de cada lane ────────────────
+    // Primero detectamos back-edges (ciclos de feedback) para ignorarlos
+    // al calcular columnas — evita que A→B→GW→ERR→A infle la columna de A.
+    const nodeCol = {};
+    steps.forEach(s => { nodeCol[s.id] = 0; });
+
     roles.forEach(role => {
-        const members = new Set(steps.filter(s => s.role === role).map(s => s.id));
-        const inDeg = {};
-        members.forEach(id => { inDeg[id] = 0; });
-        members.forEach(id => {
+        const laneSteps = steps.filter(s => s.role === role);
+        if (!laneSteps.length) return;
+        const laneIds = new Set(laneSteps.map(s => s.id));
+
+        // DFS para detectar back-edges
+        const backEdges = new Set();
+        const dfsMark = {};  // 0=unvisited 1=in-stack 2=done
+        const dfs = id => {
+            if (dfsMark[id] === 2) return;
+            dfsMark[id] = 1;
             (stepMap[id]?.next || []).forEach(nid => {
-                if (members.has(nid)) inDeg[nid] = (inDeg[nid] || 0) + 1;
+                if (!laneIds.has(nid)) return;
+                if (dfsMark[nid] === 1) backEdges.add(`${id}->${nid}`);
+                else if (!dfsMark[nid]) dfs(nid);
+            });
+            dfsMark[id] = 2;
+        };
+        laneSteps.forEach(s => { if (!dfsMark[s.id]) dfs(s.id); });
+
+        // In-degree ignorando back-edges
+        const inDeg = {};
+        laneSteps.forEach(s => { inDeg[s.id] = 0; });
+        laneSteps.forEach(s => {
+            (s.next || []).forEach(nid => {
+                if (laneIds.has(nid) && !backEdges.has(`${s.id}->${nid}`))
+                    inDeg[nid] = (inDeg[nid] || 0) + 1;
             });
         });
-        const queue = [...members].filter(id => !inDeg[id]);
-        if (!queue.length && members.size) queue.push([...members][0]);
-        const order = [], seen = new Set();
+
+        const queue = laneSteps.filter(s => inDeg[s.id] === 0).map(s => s.id);
+        if (!queue.length) queue.push(laneSteps[0].id);
+        const visited = new Set();
+
         while (queue.length) {
             const id = queue.shift();
-            if (seen.has(id)) continue;
-            seen.add(id); order.push(id);
+            if (visited.has(id)) continue;
+            visited.add(id);
             (stepMap[id]?.next || []).forEach(nid => {
-                if (members.has(nid) && !seen.has(nid)) queue.push(nid);
+                if (!laneIds.has(nid) || backEdges.has(`${id}->${nid}`)) return;
+                const newCol = (nodeCol[id] || 0) + 1;
+                if (newCol > (nodeCol[nid] || 0)) nodeCol[nid] = newCol;
+                if (!visited.has(nid)) queue.push(nid);
             });
         }
-        members.forEach(id => { if (!seen.has(id)) order.push(id); });
-        laneOrder[role] = order;
+        // Nodos no alcanzados → al final
+        const maxUsed = Math.max(0, ...laneSteps.map(s => nodeCol[s.id] || 0));
+        laneSteps.forEach(s => { if (!visited.has(s.id)) nodeCol[s.id] = maxUsed + 1; });
     });
 
-    // Assign col/row
-    const nodeCol = {}, nodeRow = {}, laneRows = {};
+    // ── PASO 2: Asignar filas (branching vertical) ──────────────────────────
+    // Los gateways con múltiples salidas dentro del mismo lane distribuyen
+    // sus salidas en filas distintas. Esto evita que las flechas se apilen.
+    const nodeRow = {};
+    steps.forEach(s => { nodeRow[s.id] = 0; });
+
     roles.forEach(role => {
-        const order = laneOrder[role] || [];
-        let maxRow = 0;
-        order.forEach((id, idx) => {
-            nodeCol[id] = idx % MAX_COLS;
-            nodeRow[id] = Math.floor(idx / MAX_COLS);
-            maxRow = Math.max(maxRow, nodeRow[id]);
+        const laneSteps = steps.filter(s => s.role === role);
+        const laneIds = new Set(laneSteps.map(s => s.id));
+
+        // Ordenar por columna para procesar de izquierda a derecha
+        const sorted = [...laneSteps].sort((a, b) => (nodeCol[a.id] || 0) - (nodeCol[b.id] || 0));
+
+        sorted.forEach(step => {
+            if (!isGW(step.type)) return;
+            const laneOuts = (step.next || []).filter(nid => laneIds.has(nid));
+            if (laneOuts.length < 2) return;
+
+            const gwRow = nodeRow[step.id] || 0;
+
+            // Propagación de fila hacia adelante por cada rama
+            const propagateRow = (startId, row) => {
+                const q = [startId];
+                const vis = new Set();
+                while (q.length) {
+                    const cid = q.shift();
+                    if (vis.has(cid) || !laneIds.has(cid)) continue;
+                    vis.add(cid);
+                    // Solo avanzar la fila si es mayor a la actual
+                    if ((nodeRow[cid] || 0) < row) nodeRow[cid] = row;
+                    (stepMap[cid]?.next || [])
+                        .filter(n => laneIds.has(n) && !vis.has(n))
+                        .forEach(n => q.push(n));
+                }
+            };
+
+            laneOuts.forEach((nid, i) => {
+                propagateRow(nid, gwRow + i);
+            });
         });
-        laneRows[role] = maxRow + 1;
     });
 
-    // Lane heights & Y positions
-    const laneH = {}, laneY = {};
+    // ── PASO 3: Calcular posiciones X por columna por lane ──────────────────
+    // Para cada lane acumulamos la posición X de cada columna teniendo en
+    // cuenta el tipo de nodo fuente y destino.
+    const colCX = {};  // `${role}__${col}` → center X
+
+    roles.forEach(role => {
+        const laneSteps = steps.filter(s => s.role === role);
+        if (!laneSteps.length) return;
+
+        const maxCol = Math.max(0, ...laneSteps.map(s => nodeCol[s.id] || 0));
+
+        // Tipo "representativo" de cada columna = el nodo de mayor anchura
+        const colRepType = {};
+        laneSteps.forEach(s => {
+            const col = nodeCol[s.id] || 0;
+            if (!colRepType[col] || sz(s.type).w > sz(colRepType[col]).w) {
+                colRepType[col] = s.type;
+            }
+        });
+
+        let cx = LANE_X + LANE_LEFT_PAD;
+        colCX[`${role}__0`] = cx;
+
+        for (let col = 0; col < maxCol; col++) {
+            const srcType = colRepType[col]  || 'userTask';
+            const dstType = colRepType[col + 1] || 'userTask';
+            cx += getHGap(srcType, dstType);
+            colCX[`${role}__${col + 1}`] = cx;
+        }
+    });
+
+    // ── PASO 4: Alturas de lane y posición Y ───────────────────────────────
+    const laneRowCount = {};
+    roles.forEach(role => {
+        const laneSteps = steps.filter(s => s.role === role);
+        if (!laneSteps.length) { laneRowCount[role] = 1; return; }
+        laneRowCount[role] = Math.max(1, ...laneSteps.map(s => (nodeRow[s.id] || 0) + 1));
+    });
+
+    const laneH = {};
+    const laneY = {};
     let curY = POOL_Y;
+
     roles.forEach((role, ri) => {
-        laneH[ri] = laneRows[role] <= 1 ? LANE_H : LANE_H_2;
+        const rows = laneRowCount[role] || 1;
+        const h = LANE_PAD_TOP + (rows - 1) * ROW_H + sz('userTask').h + LANE_PAD_BOT;
+        laneH[ri] = Math.max(LANE_MIN_H, h);
         laneY[ri] = curY;
         curY += laneH[ri];
     });
     const poolH = curY - POOL_Y;
 
-    // Node pixel positions
+    // ── PASO 5: Posiciones pixel de cada nodo ─────────────────────────────
     const pos = {};
     steps.forEach(s => {
         const { w, h } = sz(s.type);
         const ri  = roles.indexOf(s.role);
+        if (ri < 0) return;
         const col = nodeCol[s.id] ?? 0;
         const row = nodeRow[s.id] ?? 0;
-        const cx  = COL0_CX + col * COL_W;
-        const cy  = laneY[ri] + row * LANE_H + LANE_H / 2;
+        const cx  = colCX[`${s.role}__${col}`] ?? (LANE_X + LANE_LEFT_PAD + col * 200);
+        const cy  = laneY[ri] + LANE_PAD_TOP + (h / 2) + row * ROW_H;
         pos[s.id] = {
-            x: Math.round(cx - w / 2), y: Math.round(cy - h / 2),
-            w, h, cx: Math.round(cx), cy: Math.round(cy),
+            x:  Math.round(cx - w / 2),
+            y:  Math.round(cy - h / 2),
+            w, h,
+            cx: Math.round(cx),
+            cy: Math.round(cy),
         };
     });
 
-    // Pool width
-    const maxNodeRight = steps.reduce((m, s) => {
-        const p = pos[s.id]; return p ? Math.max(m, p.x + p.w) : m;
-    }, COL0_CX + (MAX_COLS - 1) * COL_W + 60);
-    const HW_BASE = maxNodeRight + 60;
+    // ── Ancho del pool ─────────────────────────────────────────────────────
+    const maxRight = steps.reduce((m, s) => {
+        const p = pos[s.id];
+        return p ? Math.max(m, p.x + p.w) : m;
+    }, LANE_X + 400);
+    const poolW = Math.max(800, maxRight + 120);
 
-    // Highway tracks
-    const hwMap = new Map();
-    let hwIdx = 0;
-    {
-        const cross = [];
-        steps.forEach(s => {
-            const si = roles.indexOf(s.role);
-            (s.next || []).forEach(tid => {
-                const t = stepMap[tid];
-                if (!t) return;
-                const ti = roles.indexOf(t.role);
-                if (ti !== si) cross.push({ src: s.id, tgt: tid, si, ti, gap: Math.abs(ti - si), col: nodeCol[s.id] ?? 0 });
-            });
-        });
-        cross.sort((a, b) => b.gap - a.gap || a.si - b.si || a.col - b.col);
-        cross.forEach(e => {
-            const key = `${e.src}->${e.tgt}`;
-            if (!hwMap.has(key)) { hwMap.set(key, HW_BASE + hwIdx * HW_STEP); hwIdx++; }
-        });
-    }
-
-    const poolW = Math.max(2000, HW_BASE + hwIdx * HW_STEP + 80);
-
+    // ── Helpers ────────────────────────────────────────────────────────────
     const P   = id => pos[id];
-    const R   = id => P(id).x + P(id).w;
-    const L   = id => P(id).x;
-    const CX  = id => P(id).cx;
-    const CY  = id => P(id).cy;
-    const wpt = pts => pts.map(([x, y]) => `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`).join('\n');
+    const CX  = id => pos[id]?.cx ?? 0;
+    const CY  = id => pos[id]?.cy ?? 0;
+    const L   = id => pos[id]?.x ?? 0;
+    const R   = id => (pos[id]?.x ?? 0) + (pos[id]?.w ?? 0);
+    const T   = id => pos[id]?.y ?? 0;
+    const BOT = id => (pos[id]?.y ?? 0) + (pos[id]?.h ?? 0);
+    const wpt = pts => pts
+        .map(([x, y]) => `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`)
+        .join('\n');
 
-    // Shapes
+    // ── SHAPES ─────────────────────────────────────────────────────────────
     let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
@@ -316,86 +387,118 @@ function generateDI(structure, processId, poolOpts = {}) {
       </bpmndi:BPMNShape>\n`;
     });
 
-    // Edges
+    // ── EDGES ──────────────────────────────────────────────────────────────
+    // Estrategia de routing:
+    //
+    // A) Mismo lane, misma fila, avance → flecha horizontal simple
+    // B) Mismo lane, misma fila, retroceso → arco por encima del lane
+    // C) Mismo lane, fila distinta → curva en L (derecha + baja)
+    // D) Cross-lane → salida por abajo, horizontal en mid-gap, entrada por arriba
+    //
     let edges = '';
+
     steps.forEach(step => {
         if (!P(step.id)) return;
-        const srcRi = roles.indexOf(step.role);
-        (step.next || []).forEach(targetId => {
+        const srcRi  = roles.indexOf(step.role);
+        const srcRow = nodeRow[step.id] ?? 0;
+
+        (step.next || []).forEach((targetId, outIdx) => {
             if (!P(targetId)) return;
-            const tgtRi  = roles.indexOf(stepMap[targetId]?.role);
+            const tgt    = stepMap[targetId];
+            if (!tgt) return;
+            const tgtRi  = roles.indexOf(tgt.role);
+            const tgtRow = nodeRow[targetId] ?? 0;
+            const tgtCol = nodeCol[targetId] ?? 0;
+            const srcCol = nodeCol[step.id] ?? 0;
+
             const edgeId = `Edge_${npid(step.id)}_${npid(targetId)}`;
             const flowId = nfid(step.id, targetId);
-            let pts;
+            const condText = step.conditions?.[targetId];
+
+            let pts = [];
 
             if (srcRi === tgtRi) {
-                // ── Same lane ─────────────────────────────────
-                const srcRow = nodeRow[step.id] ?? 0;
-                const tgtRow = nodeRow[targetId] ?? 0;
-                if (srcRow < tgtRow) {
-                    // Wrap to next row inside same lane
-                    const wrapX   = HW_BASE - 40 + srcRi * 4;
-                    const returnX = LANE_X + 10 + srcRi * 4;
-                    const midY    = laneY[srcRi] + (srcRow + 1) * LANE_H - 15;
-                    pts = [
-                        [R(step.id),  CY(step.id)],
-                        [wrapX,       CY(step.id)],
-                        [wrapX,       midY],
-                        [returnX,     midY],
-                        [returnX,     CY(targetId)],
-                        [L(targetId), CY(targetId)],
-                    ];
-                } else if (CX(targetId) <= CX(step.id)) {
-                    // Backward arc — above lane top
-                    const arcY = laneY[srcRi] + 14;
-                    pts = [
-                        [R(step.id),       CY(step.id)],
-                        [R(step.id) + 10,  CY(step.id)],
-                        [R(step.id) + 10,  arcY],
-                        [L(targetId) - 10, arcY],
-                        [L(targetId) - 10, CY(targetId)],
-                        [L(targetId),      CY(targetId)],
-                    ];
+                // ── Mismo lane ────────────────────────────────────────────
+                if (srcRow === tgtRow) {
+                    if (CX(targetId) > CX(step.id)) {
+                        // A) Avance simple
+                        pts = [
+                            [R(step.id),  CY(step.id)],
+                            [L(targetId), CY(targetId)],
+                        ];
+                    } else {
+                        // B) Retroceso — arco por encima del lane
+                        const arcY = laneY[srcRi] + 14;
+                        pts = [
+                            [R(step.id),       CY(step.id)],
+                            [R(step.id) + 14,  CY(step.id)],
+                            [R(step.id) + 14,  arcY],
+                            [L(targetId) - 14, arcY],
+                            [L(targetId) - 14, CY(targetId)],
+                            [L(targetId),      CY(targetId)],
+                        ];
+                    }
                 } else {
-                    // Simple forward
-                    pts = [[R(step.id), CY(step.id)], [L(targetId), CY(targetId)]];
+                    // C) Distinta fila dentro del mismo lane
+                    if (tgtCol > srcCol) {
+                        // Target a la derecha y en otra fila:
+                        // Salir por derecha del nodo, bajar/subir al CY destino, entrar izquierda
+                        // Usar pequeño offset para separar flechas múltiples del mismo gateway
+                        const xOff = R(step.id) + 18 + outIdx * 14;
+                        pts = [
+                            [R(step.id),  CY(step.id)],
+                            [xOff,        CY(step.id)],
+                            [xOff,        CY(targetId)],
+                            [L(targetId), CY(targetId)],
+                        ];
+                    } else {
+                        // Mismo X o target a la izquierda y distinta fila
+                        const midX = (CX(step.id) + CX(targetId)) / 2;
+                        pts = [
+                            [R(step.id),  CY(step.id)],
+                            [midX,        CY(step.id)],
+                            [midX,        CY(targetId)],
+                            [L(targetId), CY(targetId)],
+                        ];
+                    }
                 }
             } else {
-                // ── Cross-lane routing ─────────────────────────
-                // Estilo Bizagi profesional (igual al diagrama de referencia salud.bpmn):
-                //   Cada flecha usa un X ligeramente distinto para no apilarse.
-                //   Sale por la parte inferior del nodo fuente, baja hasta el espacio
-                //   entre lanes, gira horizontal al X del destino, entra por arriba.
-                //   Funciona tanto hacia adelante como hacia atrás.
-                const outIdx   = (step.next || []).indexOf(targetId);
-                const outCount = (step.next || []).length;
-                const spread   = Math.min(outCount - 1, 6) * 18;
-                const offset   = outCount > 1
-                    ? -spread / 2 + outIdx * (spread / Math.max(outCount - 1, 1))
-                    : 0;
+                // ── Cross-lane (D) ────────────────────────────────────────
+                // Salida por ABAJO del nodo fuente
+                // Baja al mid-gap entre lanes
+                // Giro horizontal hasta CX del target
+                // Sube hasta ARRIBA del target
+                const outCount = (step.next || []).filter(nid => {
+                    const t = stepMap[nid];
+                    return t && roles.indexOf(t.role) !== srcRi;
+                }).length;
+                const crossIdx = (step.next || [])
+                    .filter(nid => { const t = stepMap[nid]; return t && roles.indexOf(t.role) !== srcRi; })
+                    .indexOf(targetId);
+                const spread  = Math.min(outCount - 1, 4) * 18;
+                const offsetX = outCount > 1
+                    ? CX(step.id) - spread / 2 + crossIdx * (spread / Math.max(outCount - 1, 1))
+                    : CX(step.id);
 
-                const srcCX     = CX(step.id) + offset;
-                const tgtCX     = CX(targetId);
-                const srcBottom = P(step.id).y + P(step.id).h;
-                const tgtTop    = P(targetId).y;
+                const tgtCX    = CX(targetId);
+                const midGapY  = (laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2;
 
-                if (Math.abs(srcCX - tgtCX) < 5) {
+                if (Math.abs(offsetX - tgtCX) < 5) {
                     pts = [
-                        [srcCX, srcBottom],
-                        [srcCX, tgtTop],
+                        [offsetX, BOT(step.id)],
+                        [offsetX, T(targetId)],
                     ];
                 } else {
-                    const midY = (laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2;
                     pts = [
-                        [srcCX, srcBottom],
-                        [srcCX, midY],
-                        [tgtCX, midY],
-                        [tgtCX, tgtTop],
+                        [offsetX, BOT(step.id)],
+                        [offsetX, midGapY],
+                        [tgtCX,   midGapY],
+                        [tgtCX,   T(targetId)],
                     ];
                 }
             }
 
-            const condText = step.conditions?.[targetId];
+            // Label de condición
             let labelXml = '';
             if (condText) {
                 const labelW = Math.min(condText.length * 7 + 10, 120);
@@ -784,7 +887,6 @@ app.post('/analyze', (req, res, next) => {
             structure = JSON.parse(js);
         } catch (e) { throw new Error(`JSON inválido: ${e.message}`); }
 
-        // Si Gemini devolvió pools[] pero no roles[] al nivel raíz, derivar roles de pools
         if (!structure.roles?.length && structure.pools?.length) {
             structure.roles = structure.pools.flatMap(p => p.roles || []);
             console.log('roles derivados de pools[]: ' + structure.roles.length + ' roles');
@@ -793,14 +895,7 @@ app.post('/analyze', (req, res, next) => {
 
         const validIds = new Set(structure.steps.map(s => s.id));
 
-        // PRE-FIX: Cuando Gemini usa el mismo nombre de lane en múltiples pools
-        // (ej: "Inicio de sesión" en Pool Ciudadano Y Pool Brigadista),
-        // structure.roles tiene ese nombre duplicado.
-        // Solución: renombrar con sufijo de pool para que sean únicos.
-        // Los pasos del primer pool que use ese nombre conservan el role original renombrado.
-        // Los pools siguientes reciben un startEvent mínimo via FIX9.
         if (structure.pools?.length > 1) {
-            // Construir mapa: roleName → [poolIndex, ...]
             const rolePoolIdx = {};
             structure.pools.forEach((pool, pi) => {
                 (pool.roles || []).forEach(r => {
@@ -808,36 +903,30 @@ app.post('/analyze', (req, res, next) => {
                     rolePoolIdx[r].push(pi);
                 });
             });
-            // Para cada role que aparece en >1 pool, renombrar
             Object.entries(rolePoolIdx).forEach(([r, pis]) => {
                 if (pis.length < 2) return;
                 pis.forEach((pi, occurrence) => {
                     const newName = r + ' · ' + (pi + 1);
                     structure.pools[pi].roles = structure.pools[pi].roles.map(x => x === r ? newName : x);
                     if (occurrence === 0) {
-                        // Primer pool: reasignar pasos existentes
                         structure.steps.forEach(s => { if (s.role === r) s.role = newName; });
                         console.warn(`PRE-FIX: "${r}" → "${newName}" (pool ${pi})`);
                     } else {
-                        // Pools siguientes: no tienen pasos propios para ese role — FIX9 se encarga
                         console.warn(`PRE-FIX: pool ${pi} reclama "${r}" → "${newName}" (sin pasos, FIX9 lo maneja)`);
                     }
                 });
             });
-            // Reconstruir structure.roles desde pools actualizados
             structure.roles = structure.pools.flatMap(p => p.roles);
             console.warn('PRE-FIX roles: ' + structure.roles.length + ' roles tras normalización');
         }
 
-                // FIX 0: AUTO-SPLIT lanes con > 7 nodos lineales
+        // FIX 0: AUTO-SPLIT lanes con > 7 nodos lineales
         {
             const MAX_LANE_NODES = 7;
             const bridgeIds = new Set();
             let pass = 0, changed = true;
             while (changed && pass < 10) {
                 changed = false; pass++;
-                // Deduplicar structure.steps por ID antes de procesar
-                // Evita multiplicación exponencial si hay roles duplicados
                 {
                     const seen = new Set();
                     structure.steps = structure.steps.filter(s => {
@@ -864,7 +953,6 @@ app.post('/analyze', (req, res, next) => {
                     if (hasCycle) { newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return; }
                     changed = true;
                     const base = role.replace(/\s*-\s*Parte\s*[\d\.]+$/i, '').trim();
-                    // roleIdx ya viene del forEach — único por posición, evita colisiones con nombres iguales
                     const p1n = `${base} - Parte ${roleIdx}.1`, p2n = `${base} - Parte ${roleIdx}.2`;
                     const p1s = laneSteps.slice(0, MAX_LANE_NODES), p2s = laneSteps.slice(MAX_LANE_NODES);
                     const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
@@ -882,23 +970,17 @@ app.post('/analyze', (req, res, next) => {
                 if (changed) {
                     structure.roles = newRoles;
                     structure.steps = newSteps;
-                    // Sincronizar structure.pools con los nuevos nombres de roles.
-                    // FIX0 renombra 'Pre-registro' → 'Pre-registro - Parte 1.1' + 'Pre-registro - Parte 1.2'
-                    // Sin esto, pools[i].roles sigue con el nombre viejo → lanes vacíos en el pool correcto
-                    // y nodos cayendo en el pool equivocado.
                     if (structure.pools?.length) {
                         structure.pools.forEach(pool => {
                             const updated = [];
                             pool.roles.forEach(origRole => {
-                                // Buscar si este rol fue dividido en partes
                                 const replacements = newRoles.filter(nr =>
-                                    nr === origRole ||                          // sin cambio
-                                    nr.startsWith(origRole + ' - Parte ')       // fue dividido
+                                    nr === origRole || nr.startsWith(origRole + ' - Parte ')
                                 );
                                 if (replacements.length) updated.push(...replacements);
-                                else updated.push(origRole); // rol que no existe más — se limpiará en FIX3
+                                else updated.push(origRole);
                             });
-                            pool.roles = [...new Set(updated)]; // deduplicar por si acaso
+                            pool.roles = [...new Set(updated)];
                         });
                         console.warn('FIX0-pools: structure.pools actualizado con roles divididos');
                     }
@@ -984,14 +1066,12 @@ app.post('/analyze', (req, res, next) => {
             }
         });
 
-        // FIX 9: garantizar startEvent en cada pool definido por Gemini
-        // Funciona con cualquier número de pools (1, 2, 3, N)
+        // FIX 9: garantizar startEvent en cada pool
         {
             const poolDefs = structure.pools || null;
-            // Construir lista de grupos de roles por pool
             const poolGroups = poolDefs
                 ? poolDefs.map(p => ({ name: p.name, roles: p.roles }))
-                : [{ name: null, roles: structure.roles }]; // fallback: todo en un pool
+                : [{ name: null, roles: structure.roles }];
 
             poolGroups.forEach(({ name, roles: poolRoles }) => {
                 const poolSteps = structure.steps.filter(s => poolRoles.includes(s.role));
@@ -1001,9 +1081,6 @@ app.post('/analyze', (req, res, next) => {
                 const targets = new Set(poolSteps.flatMap(s => s.next || []).filter(id => poolIds.has(id)));
                 const firstNode = poolSteps.find(s => !targets.has(s.id)) || poolSteps[0];
                 if (firstNode && firstNode.type !== 'startEvent') {
-                    // Si ya hay un startEvent en este pool, promover a intermediateEvent (no startEvent)
-                    // Esto evita que FIX9 cree un startEvent en "Cerrar sesión" cuando el pool
-                    // ya tiene su startEvent correcto en "Inicio de sesión"
                     const alreadyHasStart = poolSteps.some(s => s.type === 'startEvent');
                     firstNode.type = alreadyHasStart ? 'intermediateEvent' : 'startEvent';
                     structure.steps.forEach(s => {
@@ -1017,35 +1094,27 @@ app.post('/analyze', (req, res, next) => {
             });
         }
 
-        // FIX 10: eliminar intermediateEvents "relay" redundantes
-        // Un intermediateEvent con exactamente 1 entrada cross-lane y 1 salida es
-        // simplemente un conector de apariencia — no aporta información al diagrama.
-        // Lo eliminamos y conectamos directamente el nodo previo con el siguiente.
-        // EXCEPCIÓN: hubs (>1 salida), bridges de FIX0, y eventos con nombre informativo
+        // FIX 10: eliminar intermediateEvents relay redundantes
         {
             const bridgePattern = /^EvtBr_/;
             let removed = true;
             while (removed) {
                 removed = false;
                 const toRemove = new Set();
-                const stepMap = {};
-                structure.steps.forEach(s => { stepMap[s.id] = s; });
+                const stepMap2 = {};
+                structure.steps.forEach(s => { stepMap2[s.id] = s; });
 
                 structure.steps.forEach(step => {
                     if (step.type !== 'intermediateEvent' && step.type !== 'intermediateEventMessage') return;
-                    if (bridgePattern.test(step.id)) return; // FIX0 bridge — mantener
+                    if (bridgePattern.test(step.id)) return;
                     const outs = step.next || [];
-                    if (outs.length !== 1) return; // hub o sin salida — mantener
-                    // Buscar todos los que apuntan a este evento
+                    if (outs.length !== 1) return;
                     const ins = structure.steps.filter(s => (s.next || []).includes(step.id));
-                    if (ins.length !== 1) return; // 0 o múltiples entradas — mantener
+                    if (ins.length !== 1) return;
                     const src = ins[0];
                     const tgt = outs[0];
-                    // Solo eliminar si la entrada viene de un lane distinto (cross-lane relay)
-                    if (src.role === step.role) return; // misma lane — es un connector interno, mantener
-                    // Reconectar src → tgt directamente
+                    if (src.role === step.role) return;
                     src.next = src.next.map(n => n === step.id ? tgt : n);
-                    // Transferir condición si existe
                     if (src.conditions?.[step.id]) {
                         src.conditions[tgt] = src.conditions[tgt] || src.conditions[step.id];
                         delete src.conditions[step.id];
@@ -1060,7 +1129,6 @@ app.post('/analyze', (req, res, next) => {
                     structure.roles = structure.roles.filter(r =>
                         structure.steps.some(s => s.role === r)
                     );
-                    // Actualizar pools también
                     if (structure.pools) {
                         structure.pools.forEach(pool => {
                             pool.roles = pool.roles.filter(r => structure.steps.some(s => s.role === r));
@@ -1070,46 +1138,37 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
-        // ─── ENSAMBLADO GENÉRICO DE N POOLS ──────────────────────────────────────
-        // Si Gemini devolvió pools[] → usamos esa definición directamente.
-        // Si no → todo en un solo pool (compatibilidad hacia atrás).
+        // ─── ENSAMBLADO GENÉRICO DE N POOLS ────────────────────────────────
         {
             const allSteps = structure.steps;
             const ts = Date.now();
 
-            // Construir definición de pools
             let poolDefs;
             if (structure.pools?.length) {
-                // Normalizar: asegurarse que cada role mencionado en steps esté en algún pool
                 const assignedRoles = new Set(structure.pools.flatMap(p => p.roles));
                 const unassigned = structure.roles.filter(r => !assignedRoles.has(r));
                 if (unassigned.length) {
-                    // Agregar roles huérfanos al último pool
                     structure.pools[structure.pools.length - 1].roles.push(...unassigned);
                     console.warn(`FIX: ${unassigned.length} roles sin pool → agregados al último`);
                 }
                 poolDefs = structure.pools;
             } else {
-                // Fallback: todo en un pool genérico
                 poolDefs = [{ name: 'Proceso de Negocio', roles: structure.roles }];
             }
 
-            // Generar un processId y lane prefix por pool
             const poolConfigs = poolDefs.map((pool, i) => ({
                 name:      pool.name || `Proceso ${i + 1}`,
                 roles:     pool.roles,
                 steps:     allSteps.filter(s => pool.roles.includes(s.role)),
                 processId: `Process_${ts + i}`,
                 poolId:    `Participant_${i + 1}`,
-                lanePrefix: i === 0 ? '' : String.fromCharCode(65 + i - 1), // '', 'A', 'B', 'C'...
+                lanePrefix: i === 0 ? '' : String.fromCharCode(65 + i - 1),
             }));
 
-            // Generar XML de lógica (procesos BPMN) para cada pool
             const logicXml = poolConfigs
                 .map(pc => generateLogic({ roles: pc.roles, steps: pc.steps }, pc.processId, pc.lanePrefix))
                 .join('\n');
 
-            // Generar DI (shapes + edges) apilando pools verticalmente
             let currentY = 60;
             const diParts = [];
             poolConfigs.forEach(pc => {
@@ -1119,7 +1178,7 @@ app.post('/analyze', (req, res, next) => {
                     { poolY: currentY, poolId: pc.poolId, poolName: pc.name, lanePrefix: pc.lanePrefix }
                 );
                 diParts.push(di);
-                currentY += di.poolH + 60; // 60px gap entre pools
+                currentY += di.poolH + 60;
             });
 
             const allShapes = diParts.map(d => d.shapesXml).join('');
