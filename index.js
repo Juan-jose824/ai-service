@@ -69,10 +69,23 @@ function generateLogic(structure, processId, lanePrefix = '') {
         switch (step.type) {
             case 'startEvent':
                 xml = `    <startEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </startEvent>`; break;
+
+            // endEvent simple: errores, cancelaciones, fin de sección sin notificación
             case 'endEvent':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </endEvent>`; break;
+
+            // endEventMessage: operación completada con notificación al usuario (usuario creado, edición guardada, etc.)
             case 'endEventMessage':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </endEvent>`; break;
+
+            // endEventTerminate: cierre de sesión — termina el proceso completo
+            case 'endEventTerminate':
+                xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <terminateEventDefinition/>\n    </endEvent>`; break;
+
+            // endEventSignal: resultado que dispara otro proceso (credencial generada, registro completado con impacto externo)
+            case 'endEventSignal':
+                xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <signalEventDefinition/>\n    </endEvent>`; break;
+
             case 'exclusiveGateway':
                 xml = `    <exclusiveGateway id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </exclusiveGateway>`; break;
             case 'userTask':
@@ -81,10 +94,19 @@ function generateLogic(structure, processId, lanePrefix = '') {
                 xml = `    <serviceTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`; break;
             case 'scriptTask':
                 xml = `    <scriptTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </scriptTask>`; break;
+
+            // intermediateEvent simple: conector entre secciones/módulos
             case 'intermediateEvent':
                 xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`; break;
+
+            // intermediateEventMessage: notificación dentro del flujo (envío de código, alerta)
             case 'intermediateEventMessage':
                 xml = `    <intermediateThrowEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`; break;
+
+            // intermediateEventMultiple: hub de menú principal que distribuye a varios módulos
+            case 'intermediateEventMultiple':
+                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <linkEventDefinition/>\n    </intermediateCatchEvent>`; break;
+
             default:
                 xml = `    <task id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </task>`;
         }
@@ -786,14 +808,30 @@ TIPOS DE NODO — definición y reglas de nombre:
     ❌ "Inicio Ciudadano" — el actor ya está en el nombre del pool/lane
 
   endEvent:
-    Fin de sección. "next": [] siempre, sin excepción.
-    Nombre descriptivo de QUÉ terminó: "Sesión cerrada", "Credencial generada",
-    "Registro completado", "CURP duplicada", "Envío fallido".
+    Fin simple. Usar para: errores de validación, cancelaciones, fin de búsqueda,
+    fin de sección sin notificación. "next": [] siempre.
+    ✅ "CURP inválida", "Acceso fallido", "Código inválido", "Búsqueda finalizada"
     ❌ Nunca solo "Fin" — agrega contexto de qué terminó.
 
   endEventMessage:
-    Fin con notificación (email, SMS). "next": [] siempre.
-    Nombre indica qué notificación: "Código enviado", "Confirmación enviada".
+    Fin con notificación al usuario (confirmación en pantalla, email, SMS).
+    Usar cuando la operación completada genera un mensaje de confirmación visible.
+    "next": [] siempre.
+    ✅ "Usuario creado", "Edición guardada", "Operación completada", "Pre-registro creado"
+    ❌ NO usar para errores ni para cierre de sesión.
+
+  endEventTerminate:
+    Fin que cierra el proceso COMPLETO. Usar EXCLUSIVAMENTE para cerrar sesión.
+    Cuando el usuario cierra sesión, el proceso termina por completo — usar este tipo.
+    "next": [] siempre.
+    ✅ "Sesión cerrada" (ÚNICO caso de uso)
+
+  endEventSignal:
+    Fin que dispara o notifica a otro proceso externo.
+    Usar cuando el resultado impacta un sistema externo o inicia otro proceso
+    (credencial generada que activa servicios de salud, registro que notifica a SAJ).
+    "next": [] siempre.
+    ✅ "Credencial generada", "Alta enviada a SAJ", "Registro completado en sistema"
 
   userTask:
     Acción visible que el usuario ejecuta en pantalla.
@@ -816,16 +854,25 @@ TIPOS DE NODO — definición y reglas de nombre:
                    "Aprobado"/"Rechazado", "Correcto"/"Incorrecto"
 
   intermediateEvent:
-    Conector entre lanes/secciones. Exactamente 1 entrada y 1 salida.
+    Conector simple entre lanes/secciones. Exactamente 1 entrada y 1 salida.
     Nombre = nombre del módulo o sección destino. Sin verbos "Iniciar", "Ir a", "Activar".
     ✅ "Verificación de cuenta", "Mis dependientes", "Cerrar sesión", "Módulo Alta"
     ❌ "Iniciar verificación de cuenta" — verbo innecesario
-    ❌ "Ir al módulo de dependientes" — descripción de acción, no de destino
     El nombre debe coincidir o resumir el nombre del lane al que pertenece.
 
   intermediateEventMessage:
-    Notificación dentro del flujo (envío de código, alerta). Nombre descriptivo corto.
-    ✅ "Enviar código verificación", "Código enviado al correo"
+    Notificación que ocurre DENTRO del flujo (no termina el proceso).
+    Usar cuando el sistema envía un mensaje al usuario y luego el flujo CONTINÚA.
+    ✅ "Enviar código verificación" (el flujo continúa esperando el código)
+    ✅ "Enviar alerta de error" (el flujo continúa con reintento)
+    ❌ NO usar si el proceso termina después — en ese caso usar endEventMessage.
+
+  intermediateEventMultiple:
+    Hub de menú principal. Usar EXCLUSIVAMENTE para el nodo que distribuye el flujo
+    a varios módulos a la vez (el menú principal después del login).
+    Tiene múltiples salidas (una por cada módulo disponible).
+    ✅ "Módulos", "Menú principal", "Menú principal Brigadista"
+    Solo debe haber 1 por pool, en el lane de inicio de sesión.
 
 ═══════════════════════════════════════════════════════════
 REGLA 7 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
@@ -908,19 +955,28 @@ Observa que CADA nodo aparece referenciado en el "next" de algún nodo anterior
 Portal Ciudadano — lanes: "Pre-registro · Recuperar contraseña · Inicio de sesión y menú · Actualizar mis datos · Unidades de Salud · Mis dependientes · Cerrar sesión"
 
 Lane "Inicio de sesión y menú":
-  Start → "Ingresar credenciales" → "Validar acceso" → Gateway(Correcto/Incorrecto) →
-    [Incorrecto] → "Mostrar error acceso" → endEvent("Acceso fallido")
-    [Correcto]   → "Acceso a ventana principal" → IntermediateEvent(Módulos) →
-      [Módulo A] [Módulo B] [Módulo C] [Cerrar sesión]
-
-  NOTA: El camino [Incorrecto] termina en endEvent, NO regresa a "Ingresar credenciales".
+  Start → "Ingresar credenciales" → "Validar acceso" → Gateway(¿Acceso correcto?) →
+    [No]  → endEvent("Acceso fallido")                  ← endEvent simple: error
+    [Sí]  → "Acceso a ventana principal" → intermediateEventMultiple("Módulos") →
+      [Módulo A] [Módulo B] [Cerrar sesión]             ← hub de menú: multiple salidas
 
 Lane "Mis dependientes":
-  IntEvt → "Ingresar CURP dependiente" → Gateway(¿Registrado?) →
-    [Registrado]     → End_CurpRegistrada
-    [No registrado]  → "Confirmar datos" → Gateway(¿Acepta?) →
-      [No] → End_ProcesoCancelado
-      [Sí] → "Información de contacto" → "Generar credencial dependiente" → End_CredencialGenerada
+  intermediateEvent → "Ingresar CURP dependiente" → Gateway(¿CURP registrada?) →
+    [Sí]  → endEvent("CURP ya registrada")              ← endEvent simple: fin sin notif.
+    [No]  → "Confirmar datos" → "Información de contacto" → "Generar credencial"
+          → endEventSignal("Credencial generada")       ← signal: impacta sistema externo
+
+Lane "Cerrar sesión":
+  intermediateEvent → "Confirmar cierre" → endEventTerminate("Sesión cerrada")
+                                           ← terminate: cierre de sesión SIEMPRE
+
+Lane "Lista de usuarios" (operación con confirmación):
+  intermediateEvent → "Nuevo usuario" → "Completar formulario" → "Confirmar registro"
+          → endEventMessage("Usuario creado")           ← message: hay confirmación visible
+
+Lane "Enviar código" (notificación dentro del flujo, no termina):
+  ... → intermediateEventMessage("Enviar código verificación") → "Ingresar código" → ...
+        ← message intermediate: el flujo CONTINÚA después de enviar
 
 [MD_START]
 **Usuarios identificados:** lista de tipos de usuario
@@ -940,13 +996,14 @@ Lane "Mis dependientes":
     {"id":"Script_Val","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión Ciudadano","next":["GW_Login"]},
     {"id":"GW_Login","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión Ciudadano","next":["End_Fallo","Task_Menu"],"conditions":{"End_Fallo":"No","Task_Menu":"Sí"}},
     {"id":"End_Fallo","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión Ciudadano","next":[]},
-    {"id":"Task_Menu","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Evt_ModA","Evt_Cerrar"]},
+    {"id":"Task_Menu","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Evt_Modulos"]},
+    {"id":"Evt_Modulos","name":"Módulos","type":"intermediateEventMultiple","role":"Inicio de sesión Ciudadano","next":["Evt_ModA","Evt_Cerrar"]},
     {"id":"Evt_ModA","name":"Módulo A","type":"intermediateEvent","role":"Módulo A","next":["Task_AccionA"]},
     {"id":"Task_AccionA","name":"Ejecutar acción A","type":"userTask","role":"Módulo A","next":["End_ModA"]},
     {"id":"End_ModA","name":"Operación realizada","type":"endEventMessage","role":"Módulo A","next":[]},
     {"id":"Evt_Cerrar","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Ciudadano","next":["Task_Cerrar"]},
     {"id":"Task_Cerrar","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Ciudadano","next":["End_Sesion"]},
-    {"id":"End_Sesion","name":"Sesión cerrada","type":"endEvent","role":"Cerrar sesión Ciudadano","next":[]},
+    {"id":"End_Sesion","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión Ciudadano","next":[]},
     {"id":"Start_B","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Brigadista","next":["Task_CredB"]},
     {"id":"Task_CredB","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Brigadista","next":["Evt_ModB","Evt_CerrarB"]},
     {"id":"Evt_ModB","name":"Módulo B","type":"intermediateEvent","role":"Módulo B","next":["Task_AccionB"]},
@@ -954,7 +1011,7 @@ Lane "Mis dependientes":
     {"id":"End_ModB","name":"Operación realizada","type":"endEventMessage","role":"Módulo B","next":[]},
     {"id":"Evt_CerrarB","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Brigadista","next":["Task_CerrarB"]},
     {"id":"Task_CerrarB","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Brigadista","next":["End_SesionB"]},
-    {"id":"End_SesionB","name":"Sesión cerrada","type":"endEvent","role":"Cerrar sesión Brigadista","next":[]}
+    {"id":"End_SesionB","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión Brigadista","next":[]}
   ]
 }
 [JSON_END]
@@ -1188,8 +1245,11 @@ app.post('/analyze', (req, res, next) => {
 
         // FIX 1: endEvent sin next — ejecutar DESPUES de FIX 0 para limpiar
         // cualquier next que FIX 0 haya podido introducir en un endEvent
+        // Cubre todos los subtipos: endEvent, endEventMessage, endEventTerminate, endEventSignal
         structure.steps.forEach(step => {
-            if (step.type?.startsWith('endEvent') && step.next?.length) { step.next = []; console.warn(`FIX1: ${step.id}`); }
+            const isEnd = step.type === 'endEvent' || step.type === 'endEventMessage' ||
+                          step.type === 'endEventTerminate' || step.type === 'endEventSignal';
+            if (isEnd && step.next?.length) { step.next = []; console.warn(`FIX1: ${step.id}`); }
         });
 
         // FIX 1b: eliminar ciclos bidireccionales directos (A->B y B->A simultaneamente)
@@ -1247,9 +1307,12 @@ app.post('/analyze', (req, res, next) => {
                 if (!laneSteps.length) return;
                 const currentTargets = new Set(structure.steps.flatMap(s => s.next || []));
                 // Solo son huérfanos los nodos que NO son endEvent y no tienen entrada
+                // Excluir TODOS los subtipos de endEvent — nunca son huérfanos a corregir
+                const isEndType = t => t === 'endEvent' || t === 'endEventMessage' ||
+                                       t === 'endEventTerminate' || t === 'endEventSignal';
                 const orphans = laneSteps.filter(s =>
                     !currentTargets.has(s.id) &&
-                    !s.type?.startsWith('endEvent')
+                    !isEndType(s.type)
                 );
                 orphans.forEach(orphan => {
                     const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
@@ -1277,11 +1340,15 @@ app.post('/analyze', (req, res, next) => {
 
         // FIX 6: nodos sin salida
         structure.steps.forEach((step, idx) => {
-            if (step.type?.startsWith('endEvent') || step.type === 'exclusiveGateway') return;
+            const isEndEvt = step.type === 'endEvent' || step.type === 'endEventMessage' ||
+                             step.type === 'endEventTerminate' || step.type === 'endEventSignal';
+            if (isEndEvt || step.type === 'exclusiveGateway') return;
             if ((step.next || []).length > 0) return;
             const nextInLane = structure.steps.slice(idx + 1).find(n => n.role === step.role);
             if (nextInLane) { step.next = [nextInLane.id]; console.warn(`FIX6: ${step.id}→${nextInLane.id}`); return; }
-            const laneHasEnd = structure.steps.some(n => n.role === step.role && n.type?.startsWith('endEvent'));
+            const laneHasEnd = structure.steps.some(n => n.role === step.role &&
+                (n.type === 'endEvent' || n.type === 'endEventMessage' ||
+                 n.type === 'endEventTerminate' || n.type === 'endEventSignal'));
             if (!laneHasEnd) {
                 const endId = `End_Auto_${step.id}`;
                 structure.steps.push({ id: endId, name: 'Fin', type: 'endEvent', role: step.role, next: [] });
