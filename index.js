@@ -29,7 +29,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CONFIG = {
     model:       'gemini-2.5-flash',
-    maxPdfChars: 280_000,   // subido de 120k — gemini-2.5-flash soporta ~200k tokens de contexto
+    maxPdfChars: 280_000,
     maxTokens:   65_536,
     temperature: 0,
     timeout:     180_000,
@@ -109,283 +109,258 @@ ${sequences}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // generateDI — versión 2.0 (layout profesional)
-//
-// PRINCIPIOS del diagrama de referencia profesional:
-//  1. Nodos pequeños (start/end/intermediate/gateway) tienen tamaño reducido
-//  2. El espaciado horizontal es moderado (~180-220px center-to-center entre tasks)
-//  3. Las salidas de gateways se distribuyen VERTICALMENTE dentro del lane
-//  4. Las flechas cross-lane salen por ABAJO del nodo fuente y entran por ARRIBA
-//  5. El ancho del pool se calcula en base al contenido real
-//  6. La altura de cada lane se calcula en base a las filas necesarias
 // ─────────────────────────────────────────────────────────────────────────────
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
-    const POOL_ID    = poolOpts.poolId    ?? 'Participant_1';
-    const POOL_Y     = poolOpts.poolY     ?? 60;
-    const LANE_PFX   = poolOpts.lanePrefix ?? '';
-    const NODE_PFX   = LANE_PFX === '' ? 'p0_' : `p${LANE_PFX}_`;
-    const npid       = id => `${NODE_PFX}${id}`;
-    const nfid       = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
+    const POOL_ID   = poolOpts.poolId    ?? 'Participant_1';
+    const POOL_Y    = poolOpts.poolY     ?? 60;
+    const LANE_PFX  = poolOpts.lanePrefix ?? '';
+    const NODE_PFX  = LANE_PFX === '' ? 'p0_' : `p${LANE_PFX}_`;
+    const npid      = id => `${NODE_PFX}${id}`;
+    const nfid      = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
 
-    // ── Tamaños de nodos ────────────────────────────────────────────────────
-    const NODE_SIZE = {
-        startEvent:               { w: 36,  h: 36  },
-        endEvent:                 { w: 36,  h: 36  },
-        endEventMessage:          { w: 36,  h: 36  },
-        exclusiveGateway:         { w: 44,  h: 44  },
-        parallelGateway:          { w: 44,  h: 44  },
-        task:                     { w: 110, h: 60  },
-        userTask:                 { w: 110, h: 60  },
-        serviceTask:              { w: 110, h: 60  },
-        scriptTask:               { w: 110, h: 60  },
-        intermediateEvent:        { w: 36,  h: 36  },
-        intermediateEventMessage: { w: 36,  h: 36  },
-    };
-    const sz       = type => NODE_SIZE[type] || NODE_SIZE.task;
-    const isSmall  = type => ['startEvent','endEvent','endEventMessage',
-                              'intermediateEvent','intermediateEventMessage'].includes(type);
-    const isGW     = type => type?.includes('Gateway');
-    const isTask   = type => !isSmall(type) && !isGW(type);
+    // ── Tamaños exactos medidos del diagrama profesional de referencia ──────
+    const NODE_W = { startEvent:30, endEvent:30, endEventMessage:30,
+                     intermediateEvent:30, intermediateEventMessage:30,
+                     exclusiveGateway:40, parallelGateway:40,
+                     userTask:90, serviceTask:90, scriptTask:90, task:90 };
+    const NODE_H = { startEvent:30, endEvent:30, endEventMessage:30,
+                     intermediateEvent:30, intermediateEventMessage:30,
+                     exclusiveGateway:40, parallelGateway:40,
+                     userTask:60, serviceTask:60, scriptTask:60, task:60 };
+    const nw = t => NODE_W[t] ?? 90;
+    const nh = t => NODE_H[t] ?? 60;
 
-    // ── Constantes de espaciado horizontal center-to-center ─────────────────
-    // Basado en mediciones del diagrama profesional de referencia
-    const H_GAP = {
-        'small→small': 140,
-        'small→task' : 160,
-        'small→gw'   : 150,
-        'task→small' : 130,
-        'task→task'  : 205,
-        'task→gw'    : 165,
-        'gw→task'    : 165,
-        'gw→small'   : 130,
-        'gw→gw'      : 150,
-    };
-    const getHGap = (srcType, dstType) => {
-        const sKey = isSmall(srcType) ? 'small' : (isGW(srcType) ? 'gw' : 'task');
-        const dKey = isSmall(dstType) ? 'small' : (isGW(dstType) ? 'gw' : 'task');
-        return H_GAP[`${sKey}→${dKey}`] ?? 190;
-    };
+    // ── Clasificadores de tipo ───────────────────────────────────────────────
+    const isSmall  = t => NODE_W[t] === 30 || NODE_W[t] === 40;
+    const isCircle = t => ['startEvent','endEvent','endEventMessage',
+                           'intermediateEvent','intermediateEventMessage'].includes(t);
+    const isGW     = t => t?.includes('Gateway');
+    const isTask   = t => !isCircle(t) && !isGW(t);
 
-    // ── Constantes de layout vertical ──────────────────────────────────────
-    const ROW_H         = 135;   // px entre centros de fila dentro de un lane
-    const LANE_PAD_TOP  = 75;    // margen superior dentro del lane
-    const LANE_PAD_BOT  = 65;    // margen inferior dentro del lane
-    const LANE_MIN_H    = 260;   // altura mínima de cualquier lane
-    const POOL_X        = 160;
-    const LABEL_W       = 30;
-    const LANE_X        = POOL_X + LABEL_W;   // 190
-    const LANE_LEFT_PAD = 85;    // padding izquierdo desde el borde del lane al primer cx
+    // ── Constantes de layout medidas del diagrama profesional ────────────────
+    // gap = espacio entre RIGHT EDGE del nodo fuente y LEFT EDGE del nodo destino
+    // Medidos en el archivo de referencia:
+    //   circle→task   ≈  98-115px  → usamos 110
+    //   task→circle   ≈  96-141px  → usamos 115
+    //   task→task     ≈ 103-229px  → usamos 155 (promedio profesional)
+    //   task→gateway  ≈  83-149px  → usamos 110
+    //   gateway→task  ≈ 109-334px  → usamos 150
+    //   circle→circle ≈ 105px      → usamos 105
+    const GAP_CC  = 105;   // circle → circle
+    const GAP_CT  = 110;   // circle → task
+    const GAP_CG  = 100;   // circle → gateway
+    const GAP_TC  = 115;   // task → circle
+    const GAP_TT  = 155;   // task → task
+    const GAP_TG  = 110;   // task → gateway
+    const GAP_GT  = 150;   // gateway → task
+    const GAP_GC  = 110;   // gateway → circle
+    const GAP_GG  = 120;   // gateway → gateway
 
-    // ── Mapa de pasos ───────────────────────────────────────────────────────
+    function getGap(srcType, tgtType) {
+        const sc = isCircle(srcType), sg = isGW(srcType);
+        const tc = isCircle(tgtType), tg = isGW(tgtType);
+        if (sc && tc) return GAP_CC;
+        if (sc && tg) return GAP_CG;
+        if (sc)       return GAP_CT;
+        if (sg && tc) return GAP_GC;
+        if (sg && tg) return GAP_GG;
+        if (sg)       return GAP_GT;
+        if (tc)       return GAP_TC;
+        if (tg)       return GAP_TG;
+        return GAP_TT;
+    }
+
+    // Dimensiones del pool
+    const POOL_LABEL_W = 30;   // ancho del label vertical del pool
+    const LANE_LABEL_W = 50;   // ancho del label vertical del lane (medido: X=50 en referencia)
+    const POOL_X       = 160;  // X absoluta del pool (incluye margen izquierdo)
+    const LANE_X       = POOL_X + LANE_LABEL_W;  // 210 — borde izquierdo del área de dibujo
+
+    // Padding dentro de cada lane
+    const LANE_PAD_LEFT  = 120;  // distancia desde LANE_X hasta el centro del primer nodo
+    const LANE_PAD_TOP   = 128;  // distancia desde lane_y hasta cy del primer nodo (medido: 117-215, promedio 128)
+    const LANE_PAD_BOT   = 100;  // margen inferior del último nodo al borde del lane
+    const LANE_MIN_H     = 240;  // altura mínima de cualquier lane
+
+    // Separación vertical entre filas dentro del mismo lane
+    const ROW_GAP = 160;  // cy_row1 → cy_row2 (medido: ~160-200px entre rows en el mismo lane)
+
+    // ── Mapa de pasos ────────────────────────────────────────────────────────
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // ── PASO 1: Asignar columnas por BFS dentro de cada lane ────────────────
-    // Primero detectamos back-edges (ciclos de feedback) para ignorarlos
-    // al calcular columnas — evita que A→B→GW→ERR→A infle la columna de A.
+    // ── PASO 1: Asignar columnas (BFS por lane, ignorando back-edges) ────────
     const nodeCol = {};
     steps.forEach(s => { nodeCol[s.id] = 0; });
 
     roles.forEach(role => {
-        const laneSteps = steps.filter(s => s.role === role);
-        if (!laneSteps.length) return;
-        const laneIds = new Set(laneSteps.map(s => s.id));
+        const ls = steps.filter(s => s.role === role);
+        if (!ls.length) return;
+        const laneIds = new Set(ls.map(s => s.id));
 
-        // DFS para detectar back-edges
+        // Detectar back-edges con DFS
         const backEdges = new Set();
-        const dfsMark = {};  // 0=unvisited 1=in-stack 2=done
+        const mark = {};
         const dfs = id => {
-            if (dfsMark[id] === 2) return;
-            dfsMark[id] = 1;
+            if (mark[id] === 2) return;
+            mark[id] = 1;
             (stepMap[id]?.next || []).forEach(nid => {
                 if (!laneIds.has(nid)) return;
-                if (dfsMark[nid] === 1) backEdges.add(`${id}->${nid}`);
-                else if (!dfsMark[nid]) dfs(nid);
+                if (mark[nid] === 1) backEdges.add(`${id}->${nid}`);
+                else if (!mark[nid]) dfs(nid);
             });
-            dfsMark[id] = 2;
+            mark[id] = 2;
         };
-        laneSteps.forEach(s => { if (!dfsMark[s.id]) dfs(s.id); });
+        ls.forEach(s => { if (!mark[s.id]) dfs(s.id); });
 
-        // In-degree ignorando back-edges
+        // BFS para asignar columnas
         const inDeg = {};
-        laneSteps.forEach(s => { inDeg[s.id] = 0; });
-        laneSteps.forEach(s => {
+        ls.forEach(s => { inDeg[s.id] = 0; });
+        ls.forEach(s => {
             (s.next || []).forEach(nid => {
                 if (laneIds.has(nid) && !backEdges.has(`${s.id}->${nid}`))
                     inDeg[nid] = (inDeg[nid] || 0) + 1;
             });
         });
-
-        const queue = laneSteps.filter(s => inDeg[s.id] === 0).map(s => s.id);
-        if (!queue.length) queue.push(laneSteps[0].id);
+        const queue = ls.filter(s => inDeg[s.id] === 0).map(s => s.id);
+        if (!queue.length) queue.push(ls[0].id);
         const visited = new Set();
-
         while (queue.length) {
             const id = queue.shift();
             if (visited.has(id)) continue;
             visited.add(id);
             (stepMap[id]?.next || []).forEach(nid => {
                 if (!laneIds.has(nid) || backEdges.has(`${id}->${nid}`)) return;
-                const newCol = (nodeCol[id] || 0) + 1;
-                if (newCol > (nodeCol[nid] || 0)) nodeCol[nid] = newCol;
+                const nc = (nodeCol[id] || 0) + 1;
+                if (nc > (nodeCol[nid] || 0)) nodeCol[nid] = nc;
                 if (!visited.has(nid)) queue.push(nid);
             });
         }
-        // Nodos no alcanzados → al final
-        const maxUsed = Math.max(0, ...laneSteps.map(s => nodeCol[s.id] || 0));
-        laneSteps.forEach(s => { if (!visited.has(s.id)) nodeCol[s.id] = maxUsed + 1; });
+        const maxC = Math.max(0, ...ls.map(s => nodeCol[s.id] || 0));
+        ls.forEach(s => { if (!visited.has(s.id)) nodeCol[s.id] = maxC + 1; });
     });
 
-    // ── PASO 2: Asignar filas (branching vertical) ──────────────────────────
-    // Los gateways con múltiples salidas dentro del mismo lane distribuyen
-    // sus salidas en filas distintas. Esto evita que las flechas se apilen.
+    // ── PASO 2: Asignar filas (branching vertical en gateways) ───────────────
     const nodeRow = {};
     steps.forEach(s => { nodeRow[s.id] = 0; });
 
     roles.forEach(role => {
-        const laneSteps = steps.filter(s => s.role === role);
-        const laneIds = new Set(laneSteps.map(s => s.id));
-
-        // Ordenar por columna para procesar de izquierda a derecha
-        const sorted = [...laneSteps].sort((a, b) => (nodeCol[a.id] || 0) - (nodeCol[b.id] || 0));
-
+        const ls = steps.filter(s => s.role === role);
+        const laneIds = new Set(ls.map(s => s.id));
+        const sorted = [...ls].sort((a, b) => (nodeCol[a.id] || 0) - (nodeCol[b.id] || 0));
         sorted.forEach(step => {
             if (!isGW(step.type)) return;
-            const laneOuts = (step.next || []).filter(nid => laneIds.has(nid));
-            if (laneOuts.length < 2) return;
-
+            const outs = (step.next || []).filter(nid => laneIds.has(nid));
+            if (outs.length < 2) return;
             const gwRow = nodeRow[step.id] || 0;
-
-            // Propagación de fila hacia adelante por cada rama
-            const propagateRow = (startId, row) => {
-                const q = [startId];
-                const vis = new Set();
+            const propagate = (startId, row) => {
+                const q = [startId]; const vis = new Set();
                 while (q.length) {
                     const cid = q.shift();
                     if (vis.has(cid) || !laneIds.has(cid)) continue;
                     vis.add(cid);
-                    // Solo avanzar la fila si es mayor a la actual
                     if ((nodeRow[cid] || 0) < row) nodeRow[cid] = row;
-                    (stepMap[cid]?.next || [])
-                        .filter(n => laneIds.has(n) && !vis.has(n))
-                        .forEach(n => q.push(n));
+                    (stepMap[cid]?.next || []).filter(n => laneIds.has(n) && !vis.has(n)).forEach(n => q.push(n));
                 }
             };
-
-            laneOuts.forEach((nid, i) => {
-                propagateRow(nid, gwRow + i);
-            });
+            outs.forEach((nid, i) => propagate(nid, gwRow + i));
         });
     });
 
-    // ── PASO 3: Calcular posiciones X por columna por lane ──────────────────
-    // Para cada lane acumulamos la posición X de cada columna teniendo en
-    // cuenta el tipo de nodo fuente y destino.
-    const colCX = {};  // `${role}__${col}` → center X
-
+    // ── PASO 3: Posición CX por columna por lane ─────────────────────────────
+    // Calculada acumulando los gaps reales entre nodo fuente y nodo destino
+    const colCX = {};
     roles.forEach(role => {
-        const laneSteps = steps.filter(s => s.role === role);
-        if (!laneSteps.length) return;
+        const ls = steps.filter(s => s.role === role);
+        if (!ls.length) return;
+        const maxCol = Math.max(0, ...ls.map(s => nodeCol[s.id] || 0));
 
-        const maxCol = Math.max(0, ...laneSteps.map(s => nodeCol[s.id] || 0));
-
-        // Tipo "representativo" de cada columna = el nodo de mayor anchura
-        const colRepType = {};
-        laneSteps.forEach(s => {
+        // Tipo representativo por columna = el de mayor ancho
+        const colType = {};
+        ls.forEach(s => {
             const col = nodeCol[s.id] || 0;
-            if (!colRepType[col] || sz(s.type).w > sz(colRepType[col]).w) {
-                colRepType[col] = s.type;
-            }
+            if (!colType[col] || nw(s.type) > nw(colType[col])) colType[col] = s.type;
         });
 
-        let cx = LANE_X + LANE_LEFT_PAD;
+        // Primera columna: LANE_X + LANE_PAD_LEFT (centro del primer nodo)
+        let cx = LANE_X + LANE_PAD_LEFT;
         colCX[`${role}__0`] = cx;
 
         for (let col = 0; col < maxCol; col++) {
-            const srcType = colRepType[col]  || 'userTask';
-            const dstType = colRepType[col + 1] || 'userTask';
-            cx += getHGap(srcType, dstType);
-            colCX[`${role}__${col + 1}`] = cx;
+            const st = colType[col]  || 'userTask';
+            const dt = colType[col+1] || 'userTask';
+            // center-to-center = mitad_ancho_src + gap + mitad_ancho_dst
+            const step = Math.round(nw(st)/2 + getGap(st, dt) + nw(dt)/2);
+            cx += step;
+            colCX[`${role}__${col+1}`] = cx;
         }
     });
 
-    // ── PASO 4: Alturas de lane y posición Y ───────────────────────────────
-    // La altura se calcula con ROW_REF_H (60px) para que sea consistente con el CY fijo.
-    // Fórmula: padTop + (rows-1)*ROW_H + ROW_REF_H + padBot
-    // 1 fila: 75 + 0 + 60 + 65 = 200 → max(260, 200) = 260px
-    // 2 filas: 75 + 135 + 60 + 65 = 335px
-    // 3 filas: 75 + 270 + 60 + 65 = 470px
-    const ROW_REF_H = 60;  // definida aquí, también usada en PASO 5
+    // ── PASO 4: Alturas de lane y posición Y ─────────────────────────────────
     const laneRowCount = {};
     roles.forEach(role => {
-        const laneSteps = steps.filter(s => s.role === role);
-        if (!laneSteps.length) { laneRowCount[role] = 1; return; }
-        laneRowCount[role] = Math.max(1, ...laneSteps.map(s => (nodeRow[s.id] || 0) + 1));
+        const ls = steps.filter(s => s.role === role);
+        laneRowCount[role] = ls.length ? Math.max(1, ...ls.map(s => (nodeRow[s.id] || 0) + 1)) : 1;
     });
 
-    const laneH = {};
-    const laneY = {};
+    const laneH = {}, laneY = {};
     let curY = POOL_Y;
-
     roles.forEach((role, ri) => {
         const rows = laneRowCount[role] || 1;
-        const h = LANE_PAD_TOP + (rows - 1) * ROW_H + ROW_REF_H + LANE_PAD_BOT;
-        laneH[ri] = Math.max(LANE_MIN_H, h);
-        laneY[ri] = curY;
+        // Altura = pad_top + (rows-1)*ROW_GAP + node_height_ref + pad_bot
+        // node_height_ref = 60 (tarea), el más alto de los nodos en la fila
+        const h = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 60 + LANE_PAD_BOT;
+        laneH[ri]   = Math.max(LANE_MIN_H, h);
+        laneY[ri]   = curY;
         curY += laneH[ri];
     });
     const poolH = curY - POOL_Y;
 
-    // ── PASO 5: Posiciones pixel de cada nodo ─────────────────────────────
-    // IMPORTANTE: el CY de cada fila es FIJO e independiente del tamaño del nodo.
-    // Sin esto, startEvent (h=36), gateway (h=44) y task (h=60) en la misma fila
-    // obtendrían CY distintos (153, 157, 165) causando desalineación y flechas torcidas.
+    // ── PASO 5: Posición pixel de cada nodo ───────────────────────────────────
+    // CY es FIJO por fila: todos los nodos de row=N tienen el mismo centro Y.
+    // Esto alinea círculos (h=30), gateways (h=40) y tareas (h=60) en la misma fila.
     const pos = {};
     steps.forEach(s => {
-        const { w, h } = sz(s.type);
+        const w = nw(s.type), h = nh(s.type);
         const ri  = roles.indexOf(s.role);
         if (ri < 0) return;
         const col = nodeCol[s.id] ?? 0;
         const row = nodeRow[s.id] ?? 0;
-        const cx  = colCX[`${s.role}__${col}`] ?? (LANE_X + LANE_LEFT_PAD + col * 200);
-        // CY fijo por fila: todos los nodos de row=N comparten el mismo centro Y
-        const cy  = laneY[ri] + LANE_PAD_TOP + ROW_REF_H / 2 + row * ROW_H;
+        const cx  = colCX[`${s.role}__${col}`] ?? (LANE_X + LANE_PAD_LEFT + col * 230);
+        const cy  = laneY[ri] + LANE_PAD_TOP + row * ROW_GAP;
         pos[s.id] = {
-            x:  Math.round(cx - w / 2),
-            y:  Math.round(cy - h / 2),   // centrado verticalmente sobre el CY de la fila
-            w, h,
-            cx: Math.round(cx),
-            cy: Math.round(cy),
+            x: Math.round(cx - w/2), y: Math.round(cy - h/2),
+            w, h, cx: Math.round(cx), cy: Math.round(cy),
         };
     });
 
-    // ── Ancho del pool ─────────────────────────────────────────────────────
+    // ── Ancho del pool ────────────────────────────────────────────────────────
     const maxRight = steps.reduce((m, s) => {
-        const p = pos[s.id];
-        return p ? Math.max(m, p.x + p.w) : m;
-    }, LANE_X + 400);
-    const poolW = Math.max(800, maxRight + 120);
+        const p = pos[s.id]; return p ? Math.max(m, p.x + p.w) : m;
+    }, LANE_X + 500);
+    const poolW = Math.max(900, maxRight + 140);
 
-    // ── Helpers ────────────────────────────────────────────────────────────
+    // ── Helpers de geometría ──────────────────────────────────────────────────
     const P   = id => pos[id];
     const CX  = id => pos[id]?.cx ?? 0;
     const CY  = id => pos[id]?.cy ?? 0;
-    const L   = id => pos[id]?.x ?? 0;
+    const L   = id => pos[id]?.x  ?? 0;
     const R   = id => (pos[id]?.x ?? 0) + (pos[id]?.w ?? 0);
-    const T   = id => pos[id]?.y ?? 0;
+    const T   = id => pos[id]?.y  ?? 0;
     const BOT = id => (pos[id]?.y ?? 0) + (pos[id]?.h ?? 0);
     const wpt = pts => pts
         .map(([x, y]) => `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`)
         .join('\n');
 
-    // ── SHAPES ─────────────────────────────────────────────────────────────
+    // ── SHAPES ────────────────────────────────────────────────────────────────
     let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
 
     roles.forEach((_, i) => {
         shapes += `      <bpmndi:BPMNShape id="Lane_${LANE_PFX}${i}_di" bpmnElement="Lane_${LANE_PFX}${i}" isHorizontal="true">
-        <dc:Bounds x="${LANE_X}" y="${laneY[i]}" width="${poolW - LABEL_W}" height="${laneH[i]}"/>
+        <dc:Bounds x="${LANE_X}" y="${laneY[i]}" width="${poolW - LANE_LABEL_W}" height="${laneH[i]}"/>
       </bpmndi:BPMNShape>\n`;
     });
 
@@ -397,20 +372,34 @@ function generateDI(structure, processId, poolOpts = {}) {
       </bpmndi:BPMNShape>\n`;
     });
 
-    // ── EDGES ──────────────────────────────────────────────────────────────
-    // Estrategia de routing:
+    // ── EDGES — routing profesional ───────────────────────────────────────────
     //
-    // A) Mismo lane, misma fila, avance → flecha horizontal simple
-    // B) Mismo lane, misma fila, retroceso → arco por encima del lane
-    // C) Mismo lane, fila distinta → curva en L (derecha + baja)
-    // D) Cross-lane → salida por abajo, horizontal en mid-gap, entrada por arriba
+    // Estrategias medidas del diagrama de referencia:
     //
+    // A) Mismo lane, misma fila, avance hacia derecha:
+    //    right_edge_src → left_edge_tgt  (línea horizontal recta)
+    //
+    // B) Mismo lane, misma fila, retroceso (back-edge):
+    //    arco por ENCIMA del lane (Y = laneY + 15)
+    //
+    // C) Mismo lane, fila distinta (gateway con ramas):
+    //    salida derecha src → codo vertical → entrada izquierda tgt
+    //
+    // D) Cross-lane — going DOWN (estrategia profesional medida):
+    //    salida INFERIOR del src → baja verticalmente al mid-gap entre lanes
+    //    → giro horizontal hasta CX del target → entrada SUPERIOR del tgt
+    //    EXCEPCIÓN: si src y tgt tienen casi el mismo CX → línea recta vertical
+    //
+    // E) Cross-lane — going UP (e.g. gateway error hacia lane superior):
+    //    salida SUPERIOR del src → sube al mid-gap → giro → entrada INFERIOR tgt
+
     let edges = '';
 
     steps.forEach(step => {
         if (!P(step.id)) return;
         const srcRi  = roles.indexOf(step.role);
         const srcRow = nodeRow[step.id] ?? 0;
+        const srcCol = nodeCol[step.id] ?? 0;
 
         (step.next || []).forEach((targetId, outIdx) => {
             if (!P(targetId)) return;
@@ -419,101 +408,121 @@ function generateDI(structure, processId, poolOpts = {}) {
             const tgtRi  = roles.indexOf(tgt.role);
             const tgtRow = nodeRow[targetId] ?? 0;
             const tgtCol = nodeCol[targetId] ?? 0;
-            const srcCol = nodeCol[step.id] ?? 0;
 
-            const edgeId = `Edge_${npid(step.id)}_${npid(targetId)}`;
-            const flowId = nfid(step.id, targetId);
+            const edgeId   = `Edge_${npid(step.id)}_${npid(targetId)}`;
+            const flowId   = nfid(step.id, targetId);
             const condText = step.conditions?.[targetId];
 
             let pts = [];
 
             if (srcRi === tgtRi) {
-                // ── Mismo lane ────────────────────────────────────────────
+                // ── Mismo lane ─────────────────────────────────────────────
                 if (srcRow === tgtRow) {
-                    if (CX(targetId) > CX(step.id)) {
-                        // A) Avance simple
+                    if (CX(targetId) >= CX(step.id)) {
+                        // A) Avance: línea horizontal recta
                         pts = [
                             [R(step.id),  CY(step.id)],
                             [L(targetId), CY(targetId)],
                         ];
                     } else {
-                        // B) Retroceso — arco por encima del lane
-                        const arcY = laneY[srcRi] + 14;
+                        // B) Retroceso: arco por encima del lane
+                        const arcY = laneY[srcRi] + 15;
                         pts = [
                             [R(step.id),       CY(step.id)],
-                            [R(step.id) + 14,  CY(step.id)],
-                            [R(step.id) + 14,  arcY],
-                            [L(targetId) - 14, arcY],
-                            [L(targetId) - 14, CY(targetId)],
+                            [R(step.id) + 15,  CY(step.id)],
+                            [R(step.id) + 15,  arcY],
+                            [L(targetId) - 15, arcY],
+                            [L(targetId) - 15, CY(targetId)],
                             [L(targetId),      CY(targetId)],
                         ];
                     }
                 } else {
-                    // C) Distinta fila dentro del mismo lane
-                    if (tgtCol > srcCol) {
-                        // Target a la derecha y en otra fila:
-                        // Salir por derecha del nodo, bajar/subir al CY destino, entrar izquierda
-                        // Usar pequeño offset para separar flechas múltiples del mismo gateway
-                        const xOff = R(step.id) + 18 + outIdx * 14;
-                        pts = [
-                            [R(step.id),  CY(step.id)],
-                            [xOff,        CY(step.id)],
-                            [xOff,        CY(targetId)],
-                            [L(targetId), CY(targetId)],
-                        ];
-                    } else {
-                        // Mismo X o target a la izquierda y distinta fila
-                        const midX = (CX(step.id) + CX(targetId)) / 2;
-                        pts = [
-                            [R(step.id),  CY(step.id)],
-                            [midX,        CY(step.id)],
-                            [midX,        CY(targetId)],
-                            [L(targetId), CY(targetId)],
-                        ];
-                    }
+                    // C) Distinta fila: codo derecha + baja/sube + entra izquierda
+                    // Separar ligeramente flechas múltiples del mismo nodo
+                    const xPad = R(step.id) + 20 + outIdx * 16;
+                    pts = [
+                        [R(step.id),  CY(step.id)],
+                        [xPad,        CY(step.id)],
+                        [xPad,        CY(targetId)],
+                        [L(targetId), CY(targetId)],
+                    ];
                 }
             } else {
-                // ── Cross-lane (D) ────────────────────────────────────────
-                // Salida por ABAJO del nodo fuente
-                // Baja al mid-gap entre lanes
-                // Giro horizontal hasta CX del target
-                // Sube hasta ARRIBA del target
-                const outCount = (step.next || []).filter(nid => {
-                    const t = stepMap[nid];
-                    return t && roles.indexOf(t.role) !== srcRi;
-                }).length;
-                const crossIdx = (step.next || [])
-                    .filter(nid => { const t = stepMap[nid]; return t && roles.indexOf(t.role) !== srcRi; })
-                    .indexOf(targetId);
-                const spread  = Math.min(outCount - 1, 4) * 18;
-                const offsetX = outCount > 1
-                    ? CX(step.id) - spread / 2 + crossIdx * (spread / Math.max(outCount - 1, 1))
-                    : CX(step.id);
+                // ── Cross-lane ─────────────────────────────────────────────
+                // Calcular el mid-gap entre los dos lanes
+                const goingDown = tgtRi > srcRi;
 
-                const tgtCX    = CX(targetId);
-                const midGapY  = (laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2;
+                // Si la diferencia horizontal es mínima → línea recta vertical
+                const deltaX = Math.abs(CX(step.id) - CX(targetId));
 
-                if (Math.abs(offsetX - tgtCX) < 5) {
-                    pts = [
-                        [offsetX, BOT(step.id)],
-                        [offsetX, T(targetId)],
-                    ];
+                if (deltaX < 12) {
+                    // Línea recta vertical: exit bottom/top → entry top/bottom
+                    if (goingDown) {
+                        pts = [
+                            [CX(step.id), BOT(step.id)],
+                            [CX(targetId), T(targetId)],
+                        ];
+                    } else {
+                        pts = [
+                            [CX(step.id), T(step.id)],
+                            [CX(targetId), BOT(targetId)],
+                        ];
+                    }
+                } else if (goingDown) {
+                    // D) Going DOWN: salida inferior → mid-gap → entrada superior
+                    // Si el target está a la DERECHA: ruta en L (baja, gira derecha)
+                    // Si el target está a la IZQUIERDA: baja por borde izquierdo del pool
+                    // (patrón del diagrama profesional para el hub de menú → módulos)
+
+                    const midGapY = Math.round((laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2);
+                    const srcCX   = CX(step.id);
+                    const tgtCX   = CX(targetId);
+
+                    if (Math.abs(srcCX - tgtCX) < 25) {
+                        // Casi alineados: línea recta con pequeño desvío
+                        pts = [
+                            [srcCX, BOT(step.id)],
+                            [srcCX, T(targetId)],
+                        ];
+                    } else if (tgtCX < srcCX - 30) {
+                        // Target muy a la izquierda (patrón menú→módulos del profesional):
+                        // baja verticalmente, luego horizontal a la izquierda
+                        pts = [
+                            [srcCX, BOT(step.id)],
+                            [srcCX, midGapY],
+                            [tgtCX, midGapY],
+                            [tgtCX, T(targetId)],
+                        ];
+                    } else {
+                        // Target a la derecha o ligeramente izquierda: ruta estándar
+                        pts = [
+                            [srcCX, BOT(step.id)],
+                            [srcCX, midGapY],
+                            [tgtCX, midGapY],
+                            [tgtCX, T(targetId)],
+                        ];
+                    }
                 } else {
+                    // E) Going UP: salida superior → mid-gap → entrada inferior
+                    const midGapY = Math.round((laneY[tgtRi] + laneH[tgtRi] + laneY[srcRi]) / 2);
+                    const srcCX   = CX(step.id);
+                    const tgtCX   = CX(targetId);
+
                     pts = [
-                        [offsetX, BOT(step.id)],
-                        [offsetX, midGapY],
-                        [tgtCX,   midGapY],
-                        [tgtCX,   T(targetId)],
+                        [srcCX, T(step.id)],
+                        [srcCX, midGapY],
+                        [tgtCX, midGapY],
+                        [tgtCX, BOT(targetId)],
                     ];
                 }
             }
 
-            // Label de condición
+            // Label de condición: posicionado junto al primer waypoint
             let labelXml = '';
             if (condText) {
-                const labelW = Math.min(condText.length * 7 + 10, 120);
-                const lx = Math.round(pts[0][0] + 4);
-                const ly = Math.round(pts[0][1] - 22);
+                const labelW = Math.min(condText.length * 7 + 12, 100);
+                const lx = Math.round(pts[0][0] + 5);
+                const ly = Math.round(pts[0][1] - 24);
                 labelXml = `\n        <bpmndi:BPMNLabel><dc:Bounds x="${lx}" y="${ly}" width="${labelW}" height="20"/></bpmndi:BPMNLabel>`;
             }
 
@@ -526,6 +535,13 @@ ${wpt(pts)}
     return { poolH, shapesXml: shapes, edgesXml: edges };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// buildPrompt — versión mejorada
+// Cambios principales respecto a la versión anterior:
+//   1. REGLA 4 reescrita: conectividad obligatoria + anti-bucle explícito
+//   2. REGLA 6 mejorada: nombres más claros para cada tipo de nodo
+//   3. REGLA 9 nueva: checklist final antes de cerrar JSON
+// ─────────────────────────────────────────────────────────────────────────────
 function buildPrompt(text) {
     return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
 
@@ -682,24 +698,67 @@ MÓDULOS SIMILARES (misma app, distintas categorías):
   Captura el propósito distintivo en 3-5 pasos concretos.
 
 ═══════════════════════════════════════════════════════════
-REGLA 4 — FLUJO ENTRE SECCIONES
+REGLA 4 — FLUJO ENTRE SECCIONES Y CONECTIVIDAD OBLIGATORIA
 ═══════════════════════════════════════════════════════════
-• endEvent / endEventMessage → "next": [] siempre. Nunca conecta a otro nodo.
-• intermediateEvent → conector entre secciones. Exactamente 1 entrada y 1 salida.
-• PROHIBIDO conectar nodos entre usuarios distintos (Ciudadano ↔ Brigadista).
 
-CONECTAR SECCIONES:
-  ✅ última_tarea_lane1 → intermediateEvent_inicio_lane2 → primera_tarea_lane2
-  ❌ endEvent → intermediateEvent   (endEvent no puede conectar)
-  ❌ intermediateEvent sin nada que apunte a él (nodo huérfano)
+REGLA FUNDAMENTAL — Todos los nodos deben estar conectados:
+  • Todo nodo DEBE tener al menos 1 entrada (aparecer en el "next" de algún nodo previo),
+    EXCEPTO los startEvent que son el punto de origen.
+  • Todo nodo DEBE tener al menos 1 salida en su propio "next",
+    EXCEPTO los endEvent y endEventMessage que terminan el flujo.
+  • Un nodo sin entrada es un nodo HUÉRFANO → el diagrama estará roto en Bizagi.
+  • Un nodo sin salida (que no sea endEvent) es un nodo MUERTO → el flujo no avanza.
 
-MENÚ CON MÓDULOS:
+CÓMO CONECTAR LANES CORRECTAMENTE:
+  El último nodo activo del lane A apunta al intermediateEvent que inicia el lane B.
+  El intermediateEvent del lane B apunta a la primera tarea del lane B.
+
+  ✅ CORRECTO:
+     Lane A: ... → Task_UltimaAccion (next: ["Evt_InicioB"])
+     Lane B: Evt_InicioB (next: ["Task_PrimeraB"]) → Task_PrimeraB → ... → End_LaneB
+
+  ❌ INCORRECTO — intermediateEvent huérfano (nadie apunta a él):
+     Lane A: ... → Task_UltimaAccion (next: ["End_LaneA"])   ← cierra mal con endEvent
+     Lane B: Evt_InicioB (next: ["Task_PrimeraB"])            ← Evt_InicioB no tiene entrada
+
+  ❌ INCORRECTO — endEvent con salida:
+     { "id":"End_A", "type":"endEvent", "next":["Evt_B"] }   ← PROHIBIDO siempre
+
+MENÚ QUE DISTRIBUYE A VARIOS MÓDULOS:
   Task_Menu → "next": ["Evt_ModA", "Evt_ModB", "Evt_CerrarSesion"]
-  Cada Evt_Mod → tareas del módulo → endEvent  (no regresa al menú)
+  Cada Evt_Mod recibe la flecha del menú y arranca su propio flujo.
+  Cada módulo termina en su propio endEvent independiente.
+  No hay regreso al menú desde ningún módulo.
 
-MÓDULO CON SUB-OPCIONES (ej: Gestión de usuarios tiene Crear, Editar, Buscar):
-  Evt_Gestion → "next": ["Task_Crear", "Task_Editar", "Task_Buscar"]
-  Cada opción termina en su propio endEvent.
+MÓDULO CON SUB-OPCIONES dentro del mismo lane:
+  Evt_Modulo → Gateway_TipoAccion → ["Task_OpcionA", "Task_OpcionB"]
+  Cada opción termina en su propio endEvent dentro del mismo lane.
+
+REGLA ANTI-BUCLE — Cómo manejar flujos de error o reintento:
+  Cuando el manual dice "si la CURP ya existe, repita el paso B", "si falla, intente de nuevo"
+  o cualquier redirección de regreso a un paso anterior → NO conectar de vuelta.
+
+  La razón es técnica: los bucles en BPMN rompen el layout en Bizagi y confunden al lector.
+  En su lugar, terminar ese camino con un endEvent con nombre descriptivo del motivo.
+
+  ✅ CORRECTO — Camino de error termina con endEvent descriptivo:
+     GW_ValidarCURP → [Sí] → Task_ConfirmarDatos → ...
+                    → [No] → End_CurpDuplicada
+
+  ✅ CORRECTO — Reintento modelado como gateway:
+     Task_EnviarSolicitud → GW_Enviado → [Sí] → Task_RecibirConfirmacion → End_OK
+                                        → [No] → Task_ReintentarEnvio → End_FalloEnvio
+
+  ❌ INCORRECTO — Bucle explícito (PROHIBIDO):
+     GW_ValidarCURP → [No] → Task_IngresarCURP   ← regresa a nodo anterior
+
+VERIFICACIÓN OBLIGATORIA antes de escribir el JSON:
+  Para cada step, confirmar:
+  1. ¿Aparece en el "next" de algún otro nodo? Si no → es huérfano, conectarlo.
+  2. Si es endEvent → "next": [] y listo.
+  3. Si es intermediateEvent → tiene exactamente 1 nodo que apunta a él y al menos 1 salida.
+  4. Si es exclusiveGateway → tiene mínimo 2 salidas y "conditions" completo.
+  5. ¿Existe algún ciclo A→B→A? → romperlo con endEvent descriptivo.
 
 ═══════════════════════════════════════════════════════════
 REGLA 5 — NO INVENTAR
@@ -709,7 +768,7 @@ Solo modela lo que el manual describe. Si algo no está claro → omítelo.
   ❌ Tareas o lanes no mencionados en el manual — PROHIBIDO
 
 ═══════════════════════════════════════════════════════════
-REGLA 6 — REGLAS TÉCNICAS
+REGLA 6 — REGLAS TÉCNICAS Y TIPOS DE NODO
 ═══════════════════════════════════════════════════════════
 • Un startEvent por tipo de usuario, en su primer lane.
 • IDs únicos sin espacios: Start_Xxx  Task_Xxx  GW_Xxx  Evt_Xxx  End_Xxx
@@ -717,16 +776,56 @@ REGLA 6 — REGLAS TÉCNICAS
 • exclusiveGateway con más de una salida → campo "conditions" obligatorio.
 • steps[] en orden de flujo: startEvent primero.
 
-TIPOS DE NODO:
-  startEvent               → Inicio del proceso (un círculo verde). Nombre corto y directo: "Inicio de sesión", "Pre-registro", "Inicio". NUNCA "Inicio Ciudadano" ni "Inicio del proceso de X".
-  endEvent                 → Fin de sección. "next": [] siempre.
-  endEventMessage          → Fin con notificación (email, SMS). "next": [] siempre.
-  userTask                 → Acción del usuario en pantalla.
-  serviceTask              → Llamada a API o sistema externo.
-  scriptTask               → Validación o proceso interno del sistema.
-  exclusiveGateway         → Decisión. Requiere "conditions" por cada salida.
-  intermediateEvent        → Conector entre secciones. Nombre = el módulo o sección destino, SIN "Iniciar", SIN "Inicio de". Ejemplos: "Pre-registro", "Mis dependientes", "Módulos", "Cerrar sesión". NUNCA "Iniciar pre-registro" ni "Inicio del módulo".
-  intermediateEventMessage → Notificación dentro del flujo (envío de código, alerta). Nombre descriptivo corto: "Enviar código", "Código enviado".
+TIPOS DE NODO — definición y reglas de nombre:
+
+  startEvent:
+    Inicio del proceso (círculo verde en Bizagi).
+    Nombre CORTO, máximo 3 palabras. Describe el evento de inicio, no al actor.
+    ✅ "Inicio de sesión", "Pre-registro", "Inicio"
+    ❌ "Inicio del proceso de credencialización del ciudadano" — demasiado largo
+    ❌ "Inicio Ciudadano" — el actor ya está en el nombre del pool/lane
+
+  endEvent:
+    Fin de sección. "next": [] siempre, sin excepción.
+    Nombre descriptivo de QUÉ terminó: "Sesión cerrada", "Credencial generada",
+    "Registro completado", "CURP duplicada", "Envío fallido".
+    ❌ Nunca solo "Fin" — agrega contexto de qué terminó.
+
+  endEventMessage:
+    Fin con notificación (email, SMS). "next": [] siempre.
+    Nombre indica qué notificación: "Código enviado", "Confirmación enviada".
+
+  userTask:
+    Acción visible que el usuario ejecuta en pantalla.
+    Verbo + objeto. ✅ "Ingresar credenciales", "Confirmar datos", "Adjuntar documento"
+
+  serviceTask:
+    Llamada automática a API o sistema externo (SAJ, RENAPO, etc.).
+    ✅ "Consultar CURP en RENAPO", "Enviar a SAJ"
+
+  scriptTask:
+    Validación o proceso interno del sistema, sin interacción del usuario.
+    ✅ "Validar formato CURP", "Verificar duplicados"
+
+  exclusiveGateway:
+    Decisión con 2 o más caminos. Nombre en forma de pregunta (máximo 5 palabras).
+    ✅ "¿CURP válida?", "¿Envío exitoso?", "¿Acepta términos?"
+    ❌ "Verificar si la CURP ingresada por el usuario es válida o no"
+    SIEMPRE incluir "conditions" con una etiqueta corta por destino:
+    Pares válidos: "Sí"/"No", "Válida"/"Inválida", "Exitoso"/"Fallido",
+                   "Aprobado"/"Rechazado", "Correcto"/"Incorrecto"
+
+  intermediateEvent:
+    Conector entre lanes/secciones. Exactamente 1 entrada y 1 salida.
+    Nombre = nombre del módulo o sección destino. Sin verbos "Iniciar", "Ir a", "Activar".
+    ✅ "Verificación de cuenta", "Mis dependientes", "Cerrar sesión", "Módulo Alta"
+    ❌ "Iniciar verificación de cuenta" — verbo innecesario
+    ❌ "Ir al módulo de dependientes" — descripción de acción, no de destino
+    El nombre debe coincidir o resumir el nombre del lane al que pertenece.
+
+  intermediateEventMessage:
+    Notificación dentro del flujo (envío de código, alerta). Nombre descriptivo corto.
+    ✅ "Enviar código verificación", "Código enviado al correo"
 
 ═══════════════════════════════════════════════════════════
 REGLA 7 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
@@ -762,12 +861,12 @@ Para evitar que la respuesta se trunque en manuales grandes, escribe cada step
 en UNA SOLA LÍNEA. Esto reduce el tamaño del JSON un 35-40% sin perder datos.
 
   ✅ CORRECTO — una línea por step:
-  {"id":"Start_A","name":"Inicio","type":"startEvent","role":"Login","next":["Task_B"]}
+  {"id":"Start_A","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión y menú","next":["Task_B"]}
 
   ❌ INCORRECTO — múltiples líneas por step:
   {
     "id": "Start_A",
-    "name": "Inicio",
+    "name": "Inicio de sesión",
     ...
   }
 
@@ -775,24 +874,53 @@ Aplica este formato a TODOS los steps sin excepción.
 El campo "pools" puede seguir con formato normal (son pocos elementos).
 
 ═══════════════════════════════════════════════════════════
+REGLA 9 — CHECKLIST FINAL ANTES DE CERRAR EL JSON
+═══════════════════════════════════════════════════════════
+Antes de escribir [JSON_END], ejecuta este checklist mentalmente:
+
+□ ¿Cada pool tiene exactamente 1 startEvent?
+□ ¿Todos los endEvent tienen "next": []?
+□ ¿Cada intermediateEvent aparece en el "next" de al menos 1 nodo anterior?
+  → Si no → está huérfano. Conectarlo desde el último nodo del lane anterior.
+□ ¿Hay algún nodo (no startEvent) cuyo id NO aparece en ningún "next" de otro nodo?
+  → Si sí → ese nodo está desconectado. Conectarlo o eliminarlo.
+□ ¿Algún nodo no-endEvent tiene "next": [] o "next" vacío?
+  → Si sí → ese nodo es un callejón sin salida. Agregar conexión al siguiente o a endEvent.
+□ ¿Algún nodo apunta a un nodo de un pool diferente?
+  → Si sí → eliminar esa conexión. Los pools son completamente independientes.
+□ ¿Algún exclusiveGateway tiene solo 1 salida?
+  → Si sí → no es gateway, convertirlo a userTask o scriptTask.
+□ ¿Existe algún ciclo directo (A→B→A) o indirecto (A→B→C→A)?
+  → Si sí → romper el ciclo: el nodo final del ciclo debe ir a un endEvent descriptivo.
+□ ¿El número total de lanes en todos los "pools" coincide con el número
+  de valores distintos en el campo "role" de todos los steps?
+  → Si no → hay roles en steps sin lane declarado o lanes sin steps. Corregir.
+
+Solo cuando todos estén verificados, escribir [JSON_END].
+
+═══════════════════════════════════════════════════════════
 EJEMPLO REAL basado en un diagrama profesional de referencia
 ═══════════════════════════════════════════════════════════
-Este ejemplo muestra el nivel de concisión y estructura esperados:
+Este ejemplo muestra el nivel de concisión, estructura y conectividad esperados.
+Observa que CADA nodo aparece referenciado en el "next" de algún nodo anterior
+(excepto los startEvent), y CADA nodo tiene salida (excepto los endEvent).
 
 Portal Ciudadano — lanes: "Pre-registro · Recuperar contraseña · Inicio de sesión y menú · Actualizar mis datos · Unidades de Salud · Mis dependientes · Cerrar sesión"
 
 Lane "Inicio de sesión y menú":
   Start → "Ingresar credenciales" → "Validar acceso" → Gateway(Correcto/Incorrecto) →
-    [Incorrecto] → "Solicitar nuevo código" → vuelve a Validar
+    [Incorrecto] → "Mostrar error acceso" → endEvent("Acceso fallido")
     [Correcto]   → "Acceso a ventana principal" → IntermediateEvent(Módulos) →
       [Módulo A] [Módulo B] [Módulo C] [Cerrar sesión]
 
+  NOTA: El camino [Incorrecto] termina en endEvent, NO regresa a "Ingresar credenciales".
+
 Lane "Mis dependientes":
-  IntEvt → "Nuevo dependiente" → Gateway(¿Registrado?) →
-    [Registrado]     → "Mensaje informativo" (endEventMessage)
+  IntEvt → "Ingresar CURP dependiente" → Gateway(¿Registrado?) →
+    [Registrado]     → End_CurpRegistrada
     [No registrado]  → "Confirmar datos" → Gateway(¿Acepta?) →
-      [No] → fin
-      [Sí] → "Información de contacto" → "Generar credencial" → fin
+      [No] → End_ProcesoCancelado
+      [Sí] → "Información de contacto" → "Generar credencial dependiente" → End_CredencialGenerada
 
 [MD_START]
 **Usuarios identificados:** lista de tipos de usuario
@@ -803,30 +931,30 @@ Lane "Mis dependientes":
 [JSON_START]
 {
   "pools": [
-    { "name": "Sistema X - Proceso A", "roles": ["Inicio de sesión y menú", "Módulo A", "Cerrar sesión"] },
-    { "name": "Sistema X - Proceso B", "roles": ["Inicio de sesión y menú B", "Módulo B", "Cerrar sesión B"] }
+    { "name": "Sistema X - Proceso A", "roles": ["Inicio de sesión Ciudadano", "Módulo A", "Cerrar sesión Ciudadano"] },
+    { "name": "Sistema X - Proceso B", "roles": ["Inicio de sesión Brigadista", "Módulo B", "Cerrar sesión Brigadista"] }
   ],
   "steps": [
-    { "id": "Start_A", "name": "Inicio de sesión", "type": "startEvent", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
-    { "id": "Task_Credenciales", "name": "Ingresar credenciales", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Script_Validar"] },
-    { "id": "Script_Validar", "name": "Validar acceso", "type": "scriptTask", "role": "Inicio de sesión y menú", "next": ["GW_Login"] },
-    { "id": "GW_Login", "name": "¿Acceso correcto?", "type": "exclusiveGateway", "role": "Inicio de sesión y menú", "next": ["Task_ErrorLogin", "Task_Menu"], "conditions": {"Task_ErrorLogin": "No", "Task_Menu": "Sí"} },
-    { "id": "Task_ErrorLogin", "name": "Mostrar error de acceso", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Task_Credenciales"] },
-    { "id": "Task_Menu", "name": "Acceso a ventana principal", "type": "userTask", "role": "Inicio de sesión y menú", "next": ["Evt_ModA", "Evt_Cerrar"] },
-    { "id": "Evt_ModA", "name": "Módulo A", "type": "intermediateEvent", "role": "Módulo A", "next": ["Task_AccionA"] },
-    { "id": "Task_AccionA", "name": "Ejecutar acción A", "type": "userTask", "role": "Módulo A", "next": ["End_ModA"] },
-    { "id": "End_ModA", "name": "Operación realizada", "type": "endEventMessage", "role": "Módulo A", "next": [] },
-    { "id": "Evt_Cerrar", "name": "Cerrar sesión", "type": "intermediateEvent", "role": "Cerrar sesión", "next": ["Task_Cerrar"] },
-    { "id": "Task_Cerrar", "name": "Confirmar cierre", "type": "userTask", "role": "Cerrar sesión", "next": ["End_Sesion"] },
-    { "id": "End_Sesion", "name": "Cerrar sesión", "type": "endEvent", "role": "Cerrar sesión", "next": [] },
-    { "id": "Start_B", "name": "Inicio de sesión", "type": "startEvent", "role": "Inicio de sesión y menú B", "next": ["Task_CredB"] },
-    { "id": "Task_CredB", "name": "Ingresar credenciales", "type": "userTask", "role": "Inicio de sesión y menú B", "next": ["Evt_ModB", "Evt_CerrarB"] },
-    { "id": "Evt_ModB", "name": "Módulo B", "type": "intermediateEvent", "role": "Módulo B", "next": ["Task_AccionB"] },
-    { "id": "Task_AccionB", "name": "Ejecutar acción B", "type": "userTask", "role": "Módulo B", "next": ["End_ModB"] },
-    { "id": "End_ModB", "name": "Operación realizada", "type": "endEventMessage", "role": "Módulo B", "next": [] },
-    { "id": "Evt_CerrarB", "name": "Cerrar sesión", "type": "intermediateEvent", "role": "Cerrar sesión B", "next": ["Task_CerrarB"] },
-    { "id": "Task_CerrarB", "name": "Confirmar cierre", "type": "userTask", "role": "Cerrar sesión B", "next": ["End_SesionB"] },
-    { "id": "End_SesionB", "name": "Cerrar sesión", "type": "endEvent", "role": "Cerrar sesión B", "next": [] }
+    {"id":"Start_A","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Ciudadano","next":["Task_Cred"]},
+    {"id":"Task_Cred","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Script_Val"]},
+    {"id":"Script_Val","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión Ciudadano","next":["GW_Login"]},
+    {"id":"GW_Login","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión Ciudadano","next":["End_Fallo","Task_Menu"],"conditions":{"End_Fallo":"No","Task_Menu":"Sí"}},
+    {"id":"End_Fallo","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión Ciudadano","next":[]},
+    {"id":"Task_Menu","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Evt_ModA","Evt_Cerrar"]},
+    {"id":"Evt_ModA","name":"Módulo A","type":"intermediateEvent","role":"Módulo A","next":["Task_AccionA"]},
+    {"id":"Task_AccionA","name":"Ejecutar acción A","type":"userTask","role":"Módulo A","next":["End_ModA"]},
+    {"id":"End_ModA","name":"Operación realizada","type":"endEventMessage","role":"Módulo A","next":[]},
+    {"id":"Evt_Cerrar","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Ciudadano","next":["Task_Cerrar"]},
+    {"id":"Task_Cerrar","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Ciudadano","next":["End_Sesion"]},
+    {"id":"End_Sesion","name":"Sesión cerrada","type":"endEvent","role":"Cerrar sesión Ciudadano","next":[]},
+    {"id":"Start_B","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Brigadista","next":["Task_CredB"]},
+    {"id":"Task_CredB","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Brigadista","next":["Evt_ModB","Evt_CerrarB"]},
+    {"id":"Evt_ModB","name":"Módulo B","type":"intermediateEvent","role":"Módulo B","next":["Task_AccionB"]},
+    {"id":"Task_AccionB","name":"Ejecutar acción B","type":"userTask","role":"Módulo B","next":["End_ModB"]},
+    {"id":"End_ModB","name":"Operación realizada","type":"endEventMessage","role":"Módulo B","next":[]},
+    {"id":"Evt_CerrarB","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Brigadista","next":["Task_CerrarB"]},
+    {"id":"Task_CerrarB","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Brigadista","next":["End_SesionB"]},
+    {"id":"End_SesionB","name":"Sesión cerrada","type":"endEvent","role":"Cerrar sesión Brigadista","next":[]}
   ]
 }
 [JSON_END]
@@ -1020,9 +1148,18 @@ app.post('/analyze', (req, res, next) => {
                     const bid = `EvtBr_${safeBase}_${pass}`;
                     bridgeIds.add(bid);
                     const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: p2n, next: [p2s[0].id] };
-                    const last = p1s[p1s.length - 1];
-                    if (last.type?.startsWith('endEvent') && !(last.next || []).length) { last.type = 'intermediateEvent'; last.next = [bid]; }
-                    else if (!last.type?.startsWith('endEvent') && !(last.next || []).includes(bid)) { last.next = [...(last.next || []), bid]; }
+                    // Buscar el último nodo de p1s que NO sea endEvent para conectar al bridge
+                    // NUNCA convertir un endEvent en intermediateEvent — eso crea bucles
+                    const lastConnectable = [...p1s].reverse().find(s => !s.type?.startsWith('endEvent'));
+                    if (lastConnectable && !(lastConnectable.next || []).includes(bid)) {
+                        lastConnectable.next = [...(lastConnectable.next || []), bid];
+                    } else if (!lastConnectable) {
+                        // Todos son endEvents — no hay nada que conectar, no crear bridge
+                        console.warn(`FIX0: lane "${role}" todos endEvents, bridge omitido`);
+                        bridgeIds.delete(bid);
+                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s));
+                        changed = false; return;
+                    }
                     p1s.forEach(s => { s.role = p1n; }); p2s.forEach(s => { s.role = p2n; });
                     newRoles.push(p1n, p2n);
                     p1s.forEach(s => newSteps.push(s)); newSteps.push(bridge); p2s.forEach(s => newSteps.push(s));
@@ -1049,10 +1186,28 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
-        // FIX 1: endEvent sin next
+        // FIX 1: endEvent sin next — ejecutar DESPUES de FIX 0 para limpiar
+        // cualquier next que FIX 0 haya podido introducir en un endEvent
         structure.steps.forEach(step => {
             if (step.type?.startsWith('endEvent') && step.next?.length) { step.next = []; console.warn(`FIX1: ${step.id}`); }
         });
+
+        // FIX 1b: eliminar ciclos bidireccionales directos (A->B y B->A simultaneamente)
+        // Estos aparecen cuando FIX 0 conecta mal nodos que terminan en endEvent
+        {
+            const stepMapCycle = {};
+            structure.steps.forEach(s => { stepMapCycle[s.id] = s; });
+            structure.steps.forEach(step => {
+                (step.next || []).forEach(nid => {
+                    const target = stepMapCycle[nid];
+                    if (!target) return;
+                    if ((target.next || []).includes(step.id)) {
+                        target.next = target.next.filter(n => n !== step.id);
+                        console.warn(`FIX1b: ciclo eliminado ${nid}->${step.id}`);
+                    }
+                });
+            });
+        }
 
         // FIX 2: referencias inexistentes
         structure.steps.forEach(step => {
@@ -1082,6 +1237,8 @@ app.post('/analyze', (req, res, next) => {
         });
 
         // FIX 5: nodos huérfanos
+        // REGLA: nunca convertir un endEvent en intermediateEvent — eso crea bucles.
+        // Solo conectar nodos huérfanos que sean intermediateEvent o startEvent (reconvertidos).
         {
             const hub = structure.steps.find(s => s.type === 'intermediateEvent' && (s.next || []).length > 1);
             structure.roles.forEach((role, ri) => {
@@ -1089,19 +1246,24 @@ app.post('/analyze', (req, res, next) => {
                 const laneSteps = structure.steps.filter(s => s.role === role);
                 if (!laneSteps.length) return;
                 const currentTargets = new Set(structure.steps.flatMap(s => s.next || []));
-                const orphans = laneSteps.filter(s => !currentTargets.has(s.id));
+                // Solo son huérfanos los nodos que NO son endEvent y no tienen entrada
+                const orphans = laneSteps.filter(s =>
+                    !currentTargets.has(s.id) &&
+                    !s.type?.startsWith('endEvent')
+                );
                 orphans.forEach(orphan => {
                     const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
                     if (updatedTargets.has(orphan.id)) return;
-                    if (orphan.type === 'startEvent') { orphan.type = 'intermediateEvent'; console.warn(`FIX5: startEvent→intermediate ${orphan.id}`); }
-                    const samelaneFinalizer = laneSteps.find(s => s !== orphan && s.type?.startsWith('endEvent') && !(s.next || []).length && !updatedTargets.has(orphan.id));
-                    if (samelaneFinalizer && orphan.type === 'intermediateEvent') {
-                        samelaneFinalizer.type = 'intermediateEvent'; samelaneFinalizer.next = [orphan.id];
-                        console.warn(`FIX5A: ${samelaneFinalizer.id}→${orphan.id}`); return;
+                    // startEvent huérfano en lane que no es el primero → convertir a intermediateEvent
+                    if (orphan.type === 'startEvent') {
+                        orphan.type = 'intermediateEvent';
+                        console.warn(`FIX5: startEvent→intermediate ${orphan.id}`);
                     }
+                    // FIX5B: conectar desde el hub de menú si el huérfano es intermediateEvent
                     if (hub && !hub.next.includes(orphan.id) && orphan.type === 'intermediateEvent') {
                         hub.next.push(orphan.id); console.warn(`FIX5B: hub→${orphan.id}`); return;
                     }
+                    // FIX5C: conectar desde el último nodo activo del lane anterior (nunca desde endEvent)
                     if (ri > 0) {
                         const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
                         const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
