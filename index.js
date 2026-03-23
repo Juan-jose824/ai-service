@@ -45,7 +45,7 @@ function xmlEscape(str) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateLogic — sin cambios
+// generateLogic
 // ─────────────────────────────────────────────────────────────────────────────
 function generateLogic(structure, processId, lanePrefix = '') {
     const { roles, steps } = structure;
@@ -70,19 +70,15 @@ function generateLogic(structure, processId, lanePrefix = '') {
             case 'startEvent':
                 xml = `    <startEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </startEvent>`; break;
 
-            // endEvent simple: errores, cancelaciones, fin de sección sin notificación
             case 'endEvent':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </endEvent>`; break;
 
-            // endEventMessage: operación completada con notificación al usuario (usuario creado, edición guardada, etc.)
             case 'endEventMessage':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </endEvent>`; break;
 
-            // endEventTerminate: cierre de sesión — termina el proceso completo
             case 'endEventTerminate':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <terminateEventDefinition/>\n    </endEvent>`; break;
 
-            // endEventSignal: resultado que dispara otro proceso (credencial generada, registro completado con impacto externo)
             case 'endEventSignal':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <signalEventDefinition/>\n    </endEvent>`; break;
 
@@ -95,17 +91,19 @@ function generateLogic(structure, processId, lanePrefix = '') {
             case 'scriptTask':
                 xml = `    <scriptTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </scriptTask>`; break;
 
-            // intermediateEvent simple: conector entre secciones/módulos
             case 'intermediateEvent':
-                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`; break;
+                // ✅ FIX: <linkEventDefinition/> evita el error "Simple no soportado" en Bizagi
+                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <linkEventDefinition/>\n    </intermediateCatchEvent>`; break;
 
-            // intermediateEventMessage: notificación dentro del flujo (envío de código, alerta)
             case 'intermediateEventMessage':
                 xml = `    <intermediateThrowEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`; break;
 
-            // intermediateEventMultiple: hub de menú principal que distribuye a varios módulos
+            // ✅ FIX 1: intermediateEventMultiple ahora se renderiza como serviceTask
+            // Antes era intermediateCatchEvent con linkEventDefinition, lo que generaba
+            // un círculo pequeño. Como el menú principal es 1 solo nodo que distribuye
+            // a varios módulos, se recomienda modelarlo como tarea de servicio.
             case 'intermediateEventMultiple':
-                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <linkEventDefinition/>\n    </intermediateCatchEvent>`; break;
+                xml = `    <serviceTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`; break;
 
             default:
                 xml = `    <task id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </task>`;
@@ -130,7 +128,7 @@ ${sequences}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateDI — versión 2.0 (layout profesional)
+// generateDI — layout profesional
 // ─────────────────────────────────────────────────────────────────────────────
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
@@ -141,7 +139,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     const npid      = id => `${NODE_PFX}${id}`;
     const nfid      = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
 
-    // ── Tamaños exactos medidos del diagrama profesional de referencia ──────
     const NODE_W = { startEvent:30, endEvent:30, endEventMessage:30,
                      intermediateEvent:30, intermediateEventMessage:30,
                      exclusiveGateway:40, parallelGateway:40,
@@ -153,31 +150,21 @@ function generateDI(structure, processId, poolOpts = {}) {
     const nw = t => NODE_W[t] ?? 90;
     const nh = t => NODE_H[t] ?? 60;
 
-    // ── Clasificadores de tipo ───────────────────────────────────────────────
     const isSmall  = t => NODE_W[t] === 30 || NODE_W[t] === 40;
     const isCircle = t => ['startEvent','endEvent','endEventMessage',
                            'intermediateEvent','intermediateEventMessage'].includes(t);
     const isGW     = t => t?.includes('Gateway');
     const isTask   = t => !isCircle(t) && !isGW(t);
 
-    // ── Constantes de layout medidas del diagrama profesional ────────────────
-    // gap = espacio entre RIGHT EDGE del nodo fuente y LEFT EDGE del nodo destino
-    // Medidos en el archivo de referencia:
-    //   circle→task   ≈  98-115px  → usamos 110
-    //   task→circle   ≈  96-141px  → usamos 115
-    //   task→task     ≈ 103-229px  → usamos 155 (promedio profesional)
-    //   task→gateway  ≈  83-149px  → usamos 110
-    //   gateway→task  ≈ 109-334px  → usamos 150
-    //   circle→circle ≈ 105px      → usamos 105
-    const GAP_CC  = 105;   // circle → circle
-    const GAP_CT  = 110;   // circle → task
-    const GAP_CG  = 100;   // circle → gateway
-    const GAP_TC  = 115;   // task → circle
-    const GAP_TT  = 155;   // task → task
-    const GAP_TG  = 110;   // task → gateway
-    const GAP_GT  = 150;   // gateway → task
-    const GAP_GC  = 110;   // gateway → circle
-    const GAP_GG  = 120;   // gateway → gateway
+    const GAP_CC  = 105;
+    const GAP_CT  = 110;
+    const GAP_CG  = 100;
+    const GAP_TC  = 115;
+    const GAP_TT  = 155;
+    const GAP_TG  = 110;
+    const GAP_GT  = 150;
+    const GAP_GC  = 110;
+    const GAP_GG  = 120;
 
     function getGap(srcType, tgtType) {
         const sc = isCircle(srcType), sg = isGW(srcType);
@@ -193,26 +180,24 @@ function generateDI(structure, processId, poolOpts = {}) {
         return GAP_TT;
     }
 
-    // Dimensiones del pool
-    const POOL_LABEL_W = 30;   // ancho del label vertical del pool
-    const LANE_LABEL_W = 50;   // ancho del label vertical del lane (medido: X=50 en referencia)
-    const POOL_X       = 160;  // X absoluta del pool (incluye margen izquierdo)
-    const LANE_X       = POOL_X + LANE_LABEL_W;  // 210 — borde izquierdo del área de dibujo
+    const POOL_LABEL_W = 30;
+    const LANE_LABEL_W = 50;
+    const POOL_X       = 160;
+    const LANE_X       = POOL_X + LANE_LABEL_W;
 
-    // Padding dentro de cada lane
-    const LANE_PAD_LEFT  = 120;  // distancia desde LANE_X hasta el centro del primer nodo
-    const LANE_PAD_TOP   = 128;  // distancia desde lane_y hasta cy del primer nodo (medido: 117-215, promedio 128)
-    const LANE_PAD_BOT   = 100;  // margen inferior del último nodo al borde del lane
-    const LANE_MIN_H     = 240;  // altura mínima de cualquier lane
+    const LANE_PAD_LEFT  = 120;
+    const LANE_PAD_TOP   = 128;
+    const LANE_PAD_BOT   = 100;
+    const LANE_MIN_H     = 240;
+    const ROW_GAP = 160;
 
-    // Separación vertical entre filas dentro del mismo lane
-    const ROW_GAP = 160;  // cy_row1 → cy_row2 (medido: ~160-200px entre rows en el mismo lane)
-
-    // ── Mapa de pasos ────────────────────────────────────────────────────────
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
 
-    // ── PASO 1: Asignar columnas (BFS por lane, ignorando back-edges) ────────
+    // ── PASO 1: Asignar columnas (BFS por lane) ──────────────────────────────
+    // ✅ FIX 2: Se incluyen también las aristas cross-lane al calcular inDeg.
+    // Esto evita que nodos que reciben de otro lane tengan inDeg=0 dentro del lane
+    // y compitan con el bridge (EvtBr_) por la columna 0, causando superposición.
     const nodeCol = {};
     steps.forEach(s => { nodeCol[s.id] = 0; });
 
@@ -239,12 +224,26 @@ function generateDI(structure, processId, poolOpts = {}) {
         // BFS para asignar columnas
         const inDeg = {};
         ls.forEach(s => { inDeg[s.id] = 0; });
+
+        // Aristas intra-lane
         ls.forEach(s => {
             (s.next || []).forEach(nid => {
                 if (laneIds.has(nid) && !backEdges.has(`${s.id}->${nid}`))
                     inDeg[nid] = (inDeg[nid] || 0) + 1;
             });
         });
+
+        // ✅ FIX 2: Aristas cross-lane (entrantes desde otros lanes)
+        // Un nodo que recibe una arista de otro lane ya tiene "algo antes",
+        // por lo que su inDeg debe ser >= 1 para no quedar en col=0 junto al bridge.
+        steps.forEach(s => {
+            if (laneIds.has(s.id)) return; // solo nodos externos al lane
+            (s.next || []).forEach(nid => {
+                if (laneIds.has(nid))
+                    inDeg[nid] = (inDeg[nid] || 0) + 1;
+            });
+        });
+
         const queue = ls.filter(s => inDeg[s.id] === 0).map(s => s.id);
         if (!queue.length) queue.push(ls[0].id);
         const visited = new Set();
@@ -263,7 +262,7 @@ function generateDI(structure, processId, poolOpts = {}) {
         ls.forEach(s => { if (!visited.has(s.id)) nodeCol[s.id] = maxC + 1; });
     });
 
-    // ── PASO 2: Asignar filas (branching vertical en gateways) ───────────────
+    // ── PASO 2: Asignar filas ─────────────────────────────────────────────────
     const nodeRow = {};
     steps.forEach(s => { nodeRow[s.id] = 0; });
 
@@ -290,36 +289,32 @@ function generateDI(structure, processId, poolOpts = {}) {
         });
     });
 
-    // ── PASO 3: Posición CX por columna por lane ─────────────────────────────
-    // Calculada acumulando los gaps reales entre nodo fuente y nodo destino
+    // ── PASO 3: Posición CX por columna por lane ──────────────────────────────
     const colCX = {};
     roles.forEach(role => {
         const ls = steps.filter(s => s.role === role);
         if (!ls.length) return;
         const maxCol = Math.max(0, ...ls.map(s => nodeCol[s.id] || 0));
 
-        // Tipo representativo por columna = el de mayor ancho
         const colType = {};
         ls.forEach(s => {
             const col = nodeCol[s.id] || 0;
             if (!colType[col] || nw(s.type) > nw(colType[col])) colType[col] = s.type;
         });
 
-        // Primera columna: LANE_X + LANE_PAD_LEFT (centro del primer nodo)
         let cx = LANE_X + LANE_PAD_LEFT;
         colCX[`${role}__0`] = cx;
 
         for (let col = 0; col < maxCol; col++) {
             const st = colType[col]  || 'userTask';
             const dt = colType[col+1] || 'userTask';
-            // center-to-center = mitad_ancho_src + gap + mitad_ancho_dst
             const step = Math.round(nw(st)/2 + getGap(st, dt) + nw(dt)/2);
             cx += step;
             colCX[`${role}__${col+1}`] = cx;
         }
     });
 
-    // ── PASO 4: Alturas de lane y posición Y ─────────────────────────────────
+    // ── PASO 4: Alturas de lane y posición Y ──────────────────────────────────
     const laneRowCount = {};
     roles.forEach(role => {
         const ls = steps.filter(s => s.role === role);
@@ -330,8 +325,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     let curY = POOL_Y;
     roles.forEach((role, ri) => {
         const rows = laneRowCount[role] || 1;
-        // Altura = pad_top + (rows-1)*ROW_GAP + node_height_ref + pad_bot
-        // node_height_ref = 60 (tarea), el más alto de los nodos en la fila
         const h = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 60 + LANE_PAD_BOT;
         laneH[ri]   = Math.max(LANE_MIN_H, h);
         laneY[ri]   = curY;
@@ -340,8 +333,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     const poolH = curY - POOL_Y;
 
     // ── PASO 5: Posición pixel de cada nodo ───────────────────────────────────
-    // CY es FIJO por fila: todos los nodos de row=N tienen el mismo centro Y.
-    // Esto alinea círculos (h=30), gateways (h=40) y tareas (h=60) en la misma fila.
     const pos = {};
     steps.forEach(s => {
         const w = nw(s.type), h = nh(s.type);
@@ -395,26 +386,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     });
 
     // ── EDGES — routing profesional ───────────────────────────────────────────
-    //
-    // Estrategias medidas del diagrama de referencia:
-    //
-    // A) Mismo lane, misma fila, avance hacia derecha:
-    //    right_edge_src → left_edge_tgt  (línea horizontal recta)
-    //
-    // B) Mismo lane, misma fila, retroceso (back-edge):
-    //    arco por ENCIMA del lane (Y = laneY + 15)
-    //
-    // C) Mismo lane, fila distinta (gateway con ramas):
-    //    salida derecha src → codo vertical → entrada izquierda tgt
-    //
-    // D) Cross-lane — going DOWN (estrategia profesional medida):
-    //    salida INFERIOR del src → baja verticalmente al mid-gap entre lanes
-    //    → giro horizontal hasta CX del target → entrada SUPERIOR del tgt
-    //    EXCEPCIÓN: si src y tgt tienen casi el mismo CX → línea recta vertical
-    //
-    // E) Cross-lane — going UP (e.g. gateway error hacia lane superior):
-    //    salida SUPERIOR del src → sube al mid-gap → giro → entrada INFERIOR tgt
-
     let edges = '';
 
     steps.forEach(step => {
@@ -438,16 +409,13 @@ function generateDI(structure, processId, poolOpts = {}) {
             let pts = [];
 
             if (srcRi === tgtRi) {
-                // ── Mismo lane ─────────────────────────────────────────────
                 if (srcRow === tgtRow) {
                     if (CX(targetId) >= CX(step.id)) {
-                        // A) Avance: línea horizontal recta
                         pts = [
                             [R(step.id),  CY(step.id)],
                             [L(targetId), CY(targetId)],
                         ];
                     } else {
-                        // B) Retroceso: arco por encima del lane
                         const arcY = laneY[srcRi] + 15;
                         pts = [
                             [R(step.id),       CY(step.id)],
@@ -459,8 +427,6 @@ function generateDI(structure, processId, poolOpts = {}) {
                         ];
                     }
                 } else {
-                    // C) Distinta fila: codo derecha + baja/sube + entra izquierda
-                    // Separar ligeramente flechas múltiples del mismo nodo
                     const xPad = R(step.id) + 20 + outIdx * 16;
                     pts = [
                         [R(step.id),  CY(step.id)],
@@ -470,15 +436,10 @@ function generateDI(structure, processId, poolOpts = {}) {
                     ];
                 }
             } else {
-                // ── Cross-lane ─────────────────────────────────────────────
-                // Calcular el mid-gap entre los dos lanes
                 const goingDown = tgtRi > srcRi;
-
-                // Si la diferencia horizontal es mínima → línea recta vertical
                 const deltaX = Math.abs(CX(step.id) - CX(targetId));
 
                 if (deltaX < 12) {
-                    // Línea recta vertical: exit bottom/top → entry top/bottom
                     if (goingDown) {
                         pts = [
                             [CX(step.id), BOT(step.id)],
@@ -491,24 +452,16 @@ function generateDI(structure, processId, poolOpts = {}) {
                         ];
                     }
                 } else if (goingDown) {
-                    // D) Going DOWN: salida inferior → mid-gap → entrada superior
-                    // Si el target está a la DERECHA: ruta en L (baja, gira derecha)
-                    // Si el target está a la IZQUIERDA: baja por borde izquierdo del pool
-                    // (patrón del diagrama profesional para el hub de menú → módulos)
-
                     const midGapY = Math.round((laneY[srcRi] + laneH[srcRi] + laneY[tgtRi]) / 2);
                     const srcCX   = CX(step.id);
                     const tgtCX   = CX(targetId);
 
                     if (Math.abs(srcCX - tgtCX) < 25) {
-                        // Casi alineados: línea recta con pequeño desvío
                         pts = [
                             [srcCX, BOT(step.id)],
                             [srcCX, T(targetId)],
                         ];
                     } else if (tgtCX < srcCX - 30) {
-                        // Target muy a la izquierda (patrón menú→módulos del profesional):
-                        // baja verticalmente, luego horizontal a la izquierda
                         pts = [
                             [srcCX, BOT(step.id)],
                             [srcCX, midGapY],
@@ -516,7 +469,6 @@ function generateDI(structure, processId, poolOpts = {}) {
                             [tgtCX, T(targetId)],
                         ];
                     } else {
-                        // Target a la derecha o ligeramente izquierda: ruta estándar
                         pts = [
                             [srcCX, BOT(step.id)],
                             [srcCX, midGapY],
@@ -525,7 +477,6 @@ function generateDI(structure, processId, poolOpts = {}) {
                         ];
                     }
                 } else {
-                    // E) Going UP: salida superior → mid-gap → entrada inferior
                     const midGapY = Math.round((laneY[tgtRi] + laneH[tgtRi] + laneY[srcRi]) / 2);
                     const srcCX   = CX(step.id);
                     const tgtCX   = CX(targetId);
@@ -539,7 +490,6 @@ function generateDI(structure, processId, poolOpts = {}) {
                 }
             }
 
-            // Label de condición: posicionado junto al primer waypoint
             let labelXml = '';
             if (condText) {
                 const labelW = Math.min(condText.length * 7 + 12, 100);
@@ -558,11 +508,7 @@ ${wpt(pts)}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// buildPrompt — versión mejorada
-// Cambios principales respecto a la versión anterior:
-//   1. REGLA 4 reescrita: conectividad obligatoria + anti-bucle explícito
-//   2. REGLA 6 mejorada: nombres más claros para cada tipo de nodo
-//   3. REGLA 9 nueva: checklist final antes de cerrar JSON
+// buildPrompt
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPrompt(text) {
     return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
@@ -873,6 +819,8 @@ TIPOS DE NODO — definición y reglas de nombre:
     Tiene múltiples salidas (una por cada módulo disponible).
     ✅ "Módulos", "Menú principal", "Menú principal Brigadista"
     Solo debe haber 1 por pool, en el lane de inicio de sesión.
+    NOTA TÉCNICA: este nodo se renderiza como tarea de servicio (serviceTask) en el
+    diagrama final, lo que mejora su legibilidad cuando hay un solo hub de distribución.
 
 ═══════════════════════════════════════════════════════════
 REGLA 7 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
@@ -1068,10 +1016,10 @@ app.post('/analyze', (req, res, next) => {
                     geminiFileUri = fileData.file?.uri;
                     console.log(`✓ PDF subido a File API: ${geminiFileUri}`);
                 } else {
-                    console.error(`⚠️  File API falló (${uploadRes.status}) — el manual será truncado a ${CONFIG.maxPdfChars} chars. El diagrama puede omitir módulos del final.`);
+                    console.error(`⚠️  File API falló (${uploadRes.status}) — el manual será truncado a ${CONFIG.maxPdfChars} chars.`);
                 }
             } catch (e) {
-                console.error(`⚠️  File API error: ${e.message} — el manual será truncado a ${CONFIG.maxPdfChars} chars. El diagrama puede omitir módulos del final.`);
+                console.error(`⚠️  File API error: ${e.message} — el manual será truncado a ${CONFIG.maxPdfChars} chars.`);
             }
         }
 
@@ -1114,9 +1062,33 @@ app.post('/analyze', (req, res, next) => {
         const mdMatch   = raw.match(/\[MD_START\]([\s\S]*?)\[MD_END\]/);
         const jsonMatch = raw.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
         let rawJson = jsonMatch ? jsonMatch[1] : null;
+
+        // ✅ FIX DIAGRAMAS GRANDES: si el JSON fue truncado, hacer una segunda llamada
+        // pidiendo a Gemini que continúe exactamente desde donde se cortó.
         if (!rawJson) {
             const partial = raw.match(/\[JSON_START\]([\s\S]*)/);
-            if (partial) { console.warn('Respuesta truncada — reparando...'); rawJson = partial[1]; }
+            if (partial) {
+                console.warn('Respuesta truncada — solicitando continuación a Gemini...');
+                const partialJson = partial[1].trim();
+                // Construir prompt de continuación con el JSON parcial
+                const continuationPrompt = `El JSON anterior fue cortado por límite de tokens. Continúa EXACTAMENTE desde donde se cortó, sin repetir nada de lo anterior. Escribe SOLO la continuación del JSON (el fragmento que falta) y termina con [JSON_END].
+
+JSON parcial hasta donde llegaste:
+${partialJson}
+
+Continúa a partir de aquí:`;
+                try {
+                    const raw2 = await callGemini(continuationPrompt);
+                    console.log(`Continuación recibida (${raw2.length} chars)`);
+                    // Extraer la continuación — puede tener [JSON_END] o no
+                    const cont = raw2.replace(/\[JSON_END\].*$/s, '').trim();
+                    rawJson = partialJson + '\n' + cont;
+                    console.warn('JSON reconstruido por continuación.');
+                } catch (contErr) {
+                    console.warn(`Continuación falló: ${contErr.message} — usando JSON parcial`);
+                    rawJson = partialJson;
+                }
+            }
         }
         if (!rawJson) throw new Error('Gemini no devolvió JSON válido. Intenta de nuevo.');
 
@@ -1203,15 +1175,25 @@ app.post('/analyze', (req, res, next) => {
                     const p1s = laneSteps.slice(0, MAX_LANE_NODES), p2s = laneSteps.slice(MAX_LANE_NODES);
                     const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
                     const bid = `EvtBr_${safeBase}_${pass}`;
+
+                    // El target del bridge debe ser un nodo con proceso real (no endEvent).
+                    // Si p2s[0] es endEvent el bridge quedaría vacío (EvtBr→endEvent sin tareas).
+                    const isEndType = t => t === 'endEvent' || t === 'endEventMessage' ||
+                                          t === 'endEventTerminate' || t === 'endEventSignal';
+                    const bridgeTarget = p2s.find(s => !isEndType(s.type));
+                    if (!bridgeTarget) {
+                        // p2s solo tiene endEvents — no tiene sentido dividir este lane
+                        console.warn(`FIX0: lane "${role}" p2s sin nodos activos, split omitido`);
+                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s));
+                        changed = false; return;
+                    }
+
                     bridgeIds.add(bid);
-                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: p2n, next: [p2s[0].id] };
-                    // Buscar el último nodo de p1s que NO sea endEvent para conectar al bridge
-                    // NUNCA convertir un endEvent en intermediateEvent — eso crea bucles
-                    const lastConnectable = [...p1s].reverse().find(s => !s.type?.startsWith('endEvent'));
+                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: p2n, next: [bridgeTarget.id] };
+                    const lastConnectable = [...p1s].reverse().find(s => !isEndType(s.type));
                     if (lastConnectable && !(lastConnectable.next || []).includes(bid)) {
                         lastConnectable.next = [...(lastConnectable.next || []), bid];
                     } else if (!lastConnectable) {
-                        // Todos son endEvents — no hay nada que conectar, no crear bridge
                         console.warn(`FIX0: lane "${role}" todos endEvents, bridge omitido`);
                         bridgeIds.delete(bid);
                         newRoles.push(role); laneSteps.forEach(s => newSteps.push(s));
@@ -1243,17 +1225,14 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
-        // FIX 1: endEvent sin next — ejecutar DESPUES de FIX 0 para limpiar
-        // cualquier next que FIX 0 haya podido introducir en un endEvent
-        // Cubre todos los subtipos: endEvent, endEventMessage, endEventTerminate, endEventSignal
+        // FIX 1: endEvent sin next
         structure.steps.forEach(step => {
             const isEnd = step.type === 'endEvent' || step.type === 'endEventMessage' ||
                           step.type === 'endEventTerminate' || step.type === 'endEventSignal';
             if (isEnd && step.next?.length) { step.next = []; console.warn(`FIX1: ${step.id}`); }
         });
 
-        // FIX 1b: eliminar ciclos bidireccionales directos (A->B y B->A simultaneamente)
-        // Estos aparecen cuando FIX 0 conecta mal nodos que terminan en endEvent
+        // FIX 1b: eliminar ciclos bidireccionales directos
         {
             const stepMapCycle = {};
             structure.steps.forEach(s => { stepMapCycle[s.id] = s; });
@@ -1297,8 +1276,6 @@ app.post('/analyze', (req, res, next) => {
         });
 
         // FIX 5: nodos huérfanos
-        // REGLA: nunca convertir un endEvent en intermediateEvent — eso crea bucles.
-        // Solo conectar nodos huérfanos que sean intermediateEvent o startEvent (reconvertidos).
         {
             const hub = structure.steps.find(s => s.type === 'intermediateEvent' && (s.next || []).length > 1);
             structure.roles.forEach((role, ri) => {
@@ -1306,8 +1283,6 @@ app.post('/analyze', (req, res, next) => {
                 const laneSteps = structure.steps.filter(s => s.role === role);
                 if (!laneSteps.length) return;
                 const currentTargets = new Set(structure.steps.flatMap(s => s.next || []));
-                // Solo son huérfanos los nodos que NO son endEvent y no tienen entrada
-                // Excluir TODOS los subtipos de endEvent — nunca son huérfanos a corregir
                 const isEndType = t => t === 'endEvent' || t === 'endEventMessage' ||
                                        t === 'endEventTerminate' || t === 'endEventSignal';
                 const orphans = laneSteps.filter(s =>
@@ -1317,16 +1292,13 @@ app.post('/analyze', (req, res, next) => {
                 orphans.forEach(orphan => {
                     const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
                     if (updatedTargets.has(orphan.id)) return;
-                    // startEvent huérfano en lane que no es el primero → convertir a intermediateEvent
                     if (orphan.type === 'startEvent') {
                         orphan.type = 'intermediateEvent';
                         console.warn(`FIX5: startEvent→intermediate ${orphan.id}`);
                     }
-                    // FIX5B: conectar desde el hub de menú si el huérfano es intermediateEvent
                     if (hub && !hub.next.includes(orphan.id) && orphan.type === 'intermediateEvent') {
                         hub.next.push(orphan.id); console.warn(`FIX5B: hub→${orphan.id}`); return;
                     }
-                    // FIX5C: conectar desde el último nodo activo del lane anterior (nunca desde endEvent)
                     if (ri > 0) {
                         const prevLane = structure.steps.filter(s => s.role === structure.roles[ri - 1]);
                         const connector = [...prevLane].reverse().find(s => !s.type?.startsWith('endEvent'));
@@ -1382,50 +1354,6 @@ app.post('/analyze', (req, res, next) => {
                     console.warn(`FIX9: ${firstNode.id}→startEvent`);
                 }
             });
-        }
-
-        // FIX 10: eliminar intermediateEvents relay redundantes
-        {
-            const bridgePattern = /^EvtBr_/;
-            let removed = true;
-            while (removed) {
-                removed = false;
-                const toRemove = new Set();
-                const stepMap2 = {};
-                structure.steps.forEach(s => { stepMap2[s.id] = s; });
-
-                structure.steps.forEach(step => {
-                    if (step.type !== 'intermediateEvent' && step.type !== 'intermediateEventMessage') return;
-                    if (bridgePattern.test(step.id)) return;
-                    const outs = step.next || [];
-                    if (outs.length !== 1) return;
-                    const ins = structure.steps.filter(s => (s.next || []).includes(step.id));
-                    if (ins.length !== 1) return;
-                    const src = ins[0];
-                    const tgt = outs[0];
-                    if (src.role === step.role) return;
-                    src.next = src.next.map(n => n === step.id ? tgt : n);
-                    if (src.conditions?.[step.id]) {
-                        src.conditions[tgt] = src.conditions[tgt] || src.conditions[step.id];
-                        delete src.conditions[step.id];
-                    }
-                    toRemove.add(step.id);
-                    console.warn(`FIX10: relay eliminado ${step.id} ("${step.name}") ${src.id}→${tgt}`);
-                    removed = true;
-                });
-
-                if (toRemove.size) {
-                    structure.steps = structure.steps.filter(s => !toRemove.has(s.id));
-                    structure.roles = structure.roles.filter(r =>
-                        structure.steps.some(s => s.role === r)
-                    );
-                    if (structure.pools) {
-                        structure.pools.forEach(pool => {
-                            pool.roles = pool.roles.filter(r => structure.steps.some(s => s.role === r));
-                        });
-                    }
-                }
-            }
         }
 
         // ─── ENSAMBLADO GENÉRICO DE N POOLS ────────────────────────────────
