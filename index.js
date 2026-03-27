@@ -139,14 +139,14 @@ function generateDI(structure, processId, poolOpts = {}) {
     const npid      = id => `${NODE_PFX}${id}`;
     const nfid      = (s, t) => `Flow_${NODE_PFX}${s}_${NODE_PFX}${t}`;
 
-    const NODE_W = { startEvent:30, endEvent:30, endEventMessage:30,
-                     intermediateEvent:30, intermediateEventMessage:30,
-                     exclusiveGateway:40, parallelGateway:40,
-                     userTask:90, serviceTask:90, scriptTask:90, task:90 };
-    const NODE_H = { startEvent:30, endEvent:30, endEventMessage:30,
-                     intermediateEvent:30, intermediateEventMessage:30,
-                     exclusiveGateway:40, parallelGateway:40,
-                     userTask:60, serviceTask:60, scriptTask:60, task:60 };
+    const NODE_W = { startEvent:24, endEvent:24, endEventMessage:24,
+                     intermediateEvent:24, intermediateEventMessage:24,
+                     exclusiveGateway:32, parallelGateway:32,
+                     userTask:70, serviceTask:70, scriptTask:70, task:70 };
+    const NODE_H = { startEvent:24, endEvent:24, endEventMessage:24,
+                     intermediateEvent:24, intermediateEventMessage:24,
+                     exclusiveGateway:32, parallelGateway:32,
+                     userTask:45, serviceTask:45, scriptTask:45, task:45 };
     const nw = t => NODE_W[t] ?? 90;
     const nh = t => NODE_H[t] ?? 60;
 
@@ -156,15 +156,15 @@ function generateDI(structure, processId, poolOpts = {}) {
     const isGW     = t => t?.includes('Gateway');
     const isTask   = t => !isCircle(t) && !isGW(t);
 
-    const GAP_CC  = 105;
-    const GAP_CT  = 110;
-    const GAP_CG  = 100;
-    const GAP_TC  = 115;
-    const GAP_TT  = 155;
-    const GAP_TG  = 110;
-    const GAP_GT  = 150;
-    const GAP_GC  = 110;
-    const GAP_GG  = 120;
+    const GAP_CC  = 60;
+    const GAP_CT  = 65;
+    const GAP_CG  = 55;
+    const GAP_TC  = 65;
+    const GAP_TT  = 90;
+    const GAP_TG  = 60;
+    const GAP_GT  = 85;
+    const GAP_GC  = 60;
+    const GAP_GG  = 65;
 
     function getGap(srcType, tgtType) {
         const sc = isCircle(srcType), sg = isGW(srcType);
@@ -185,11 +185,11 @@ function generateDI(structure, processId, poolOpts = {}) {
     const POOL_X       = 160;
     const LANE_X       = POOL_X + LANE_LABEL_W;
 
-    const LANE_PAD_LEFT  = 120;
-    const LANE_PAD_TOP   = 128;
-    const LANE_PAD_BOT   = 100;
-    const LANE_MIN_H     = 240;
-    const ROW_GAP = 160;
+    const LANE_PAD_LEFT  = 75;
+    const LANE_PAD_TOP   = 75;
+    const LANE_PAD_BOT   = 55;
+    const LANE_MIN_H     = 160;
+    const ROW_GAP = 105;
 
     const stepMap = {};
     steps.forEach(s => { stepMap[s.id] = s; });
@@ -325,7 +325,7 @@ function generateDI(structure, processId, poolOpts = {}) {
     let curY = POOL_Y;
     roles.forEach((role, ri) => {
         const rows = laneRowCount[role] || 1;
-        const h = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 60 + LANE_PAD_BOT;
+        const h = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 45 + LANE_PAD_BOT;
         laneH[ri]   = Math.max(LANE_MIN_H, h);
         laneY[ri]   = curY;
         curY += laneH[ri];
@@ -603,6 +603,28 @@ ESTRUCTURA DE LANES dentro de cada pool:
   1. Primer lane: startEvent + login + menú principal
   2. [Un lane por cada módulo/sección, con el nombre exacto del módulo]
   3. Último lane: cierre de sesión
+
+LANE DE INICIO DE SESIÓN — ESTRUCTURA FIJA (OBLIGATORIA):
+  El lane de inicio de sesión tiene EXACTAMENTE estos 7 nodos, ni uno más ni uno menos:
+
+    startEvent("Inicio de sesión")
+    → userTask("Ingresar credenciales")
+    → scriptTask("Validar acceso")
+    → exclusiveGateway("¿Acceso correcto?")
+        → [No]  endEvent("Acceso fallido")
+        → [Sí]  userTask("Acceso a ventana principal")
+                → intermediateEventMultiple("Menú principal")  ← hub que distribuye a todos los módulos
+
+  ❌ PROHIBIDO en el lane de inicio de sesión:
+     • Añadir recuperación de contraseña aquí — tiene su propio lane separado
+     • Añadir validación de sesión previa, captcha, 2FA u otros pasos extra
+     • Añadir más de 1 gateway
+     • Superar los 7 nodos bajo ninguna circunstancia
+     • Poner el intermediateEventMultiple antes del userTask "Acceso a ventana principal"
+
+  El intermediateEventMultiple es el ÚNICO punto de salida hacia todos los módulos.
+  Sus "next" deben incluir el intermediateEvent de entrada de CADA lane de módulo,
+  más el intermediateEvent del lane de cierre de sesión.
 
 ⚠️ NOMBRES DE LANES — REGLA CRÍTICA:
   Cada lane en todo el JSON debe tener un nombre ÚNICO en todo el documento.
@@ -902,11 +924,15 @@ Observa que CADA nodo aparece referenciado en el "next" de algún nodo anterior
 
 Portal Ciudadano — lanes: "Pre-registro · Recuperar contraseña · Inicio de sesión y menú · Actualizar mis datos · Unidades de Salud · Mis dependientes · Cerrar sesión"
 
-Lane "Inicio de sesión y menú":
-  Start → "Ingresar credenciales" → "Validar acceso" → Gateway(¿Acceso correcto?) →
-    [No]  → endEvent("Acceso fallido")                  ← endEvent simple: error
-    [Sí]  → "Acceso a ventana principal" → intermediateEventMultiple("Módulos") →
-      [Módulo A] [Módulo B] [Cerrar sesión]             ← hub de menú: multiple salidas
+Lane "Inicio de sesión y menú":  ← ESTRUCTURA FIJA — siempre exactamente estos 7 nodos
+  Start("Inicio de sesión")
+  → userTask("Ingresar credenciales")
+  → scriptTask("Validar acceso")
+  → Gateway("¿Acceso correcto?") →
+      [No]  → endEvent("Acceso fallido")                ← endEvent simple: error
+      [Sí]  → userTask("Acceso a ventana principal")
+              → intermediateEventMultiple("Menú principal") →
+                  [Módulo A] [Módulo B] [Cerrar sesión]  ← hub: 1 salida por módulo + cerrar
 
 Lane "Mis dependientes":
   intermediateEvent → "Ingresar CURP dependiente" → Gateway(¿CURP registrada?) →
@@ -953,7 +979,12 @@ Lane "Enviar código" (notificación dentro del flujo, no termina):
     {"id":"Task_Cerrar","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Ciudadano","next":["End_Sesion"]},
     {"id":"End_Sesion","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión Ciudadano","next":[]},
     {"id":"Start_B","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Brigadista","next":["Task_CredB"]},
-    {"id":"Task_CredB","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Brigadista","next":["Evt_ModB","Evt_CerrarB"]},
+    {"id":"Task_CredB","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Brigadista","next":["Script_ValB"]},
+    {"id":"Script_ValB","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión Brigadista","next":["GW_LoginB"]},
+    {"id":"GW_LoginB","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión Brigadista","next":["End_FalloB","Task_MenuB"],"conditions":{"End_FalloB":"No","Task_MenuB":"Sí"}},
+    {"id":"End_FalloB","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión Brigadista","next":[]},
+    {"id":"Task_MenuB","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Brigadista","next":["Evt_ModulosB"]},
+    {"id":"Evt_ModulosB","name":"Menú principal Brigadista","type":"intermediateEventMultiple","role":"Inicio de sesión Brigadista","next":["Evt_ModB","Evt_CerrarB"]},
     {"id":"Evt_ModB","name":"Módulo B","type":"intermediateEvent","role":"Módulo B","next":["Task_AccionB"]},
     {"id":"Task_AccionB","name":"Ejecutar acción B","type":"userTask","role":"Módulo B","next":["End_ModB"]},
     {"id":"End_ModB","name":"Operación realizada","type":"endEventMessage","role":"Módulo B","next":[]},
