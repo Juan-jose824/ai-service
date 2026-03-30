@@ -93,7 +93,7 @@ function generateLogic(structure, processId, lanePrefix = '') {
 
             case 'intermediateEvent':
                 // ✅ FIX: <linkEventDefinition/> evita el error "Simple no soportado" en Bizagi
-                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <linkEventDefinition/>\n    </intermediateCatchEvent>`; break;
+                xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`; break;
 
             case 'intermediateEventMessage':
                 xml = `    <intermediateThrowEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`; break;
