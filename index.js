@@ -69,19 +69,14 @@ function generateLogic(structure, processId, lanePrefix = '') {
         switch (step.type) {
             case 'startEvent':
                 xml = `    <startEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </startEvent>`; break;
-
             case 'endEvent':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </endEvent>`; break;
-
             case 'endEventMessage':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </endEvent>`; break;
-
             case 'endEventTerminate':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <terminateEventDefinition/>\n    </endEvent>`; break;
-
             case 'endEventSignal':
                 xml = `    <endEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <signalEventDefinition/>\n    </endEvent>`; break;
-
             case 'exclusiveGateway':
                 xml = `    <exclusiveGateway id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </exclusiveGateway>`; break;
             case 'userTask':
@@ -90,26 +85,34 @@ function generateLogic(structure, processId, lanePrefix = '') {
                 xml = `    <serviceTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`; break;
             case 'scriptTask':
                 xml = `    <scriptTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </scriptTask>`; break;
-
             case 'intermediateEvent':
-                // ✅ FIX: <linkEventDefinition/> evita el error "Simple no soportado" en Bizagi
                 xml = `    <intermediateCatchEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </intermediateCatchEvent>`; break;
-
             case 'intermediateEventMessage':
                 xml = `    <intermediateThrowEvent id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n      <messageEventDefinition/>\n    </intermediateThrowEvent>`; break;
-
-            // ✅ FIX 1: intermediateEventMultiple ahora se renderiza como serviceTask
-            // Antes era intermediateCatchEvent con linkEventDefinition, lo que generaba
-            // un círculo pequeño. Como el menú principal es 1 solo nodo que distribuye
-            // a varios módulos, se recomienda modelarlo como tarea de servicio.
             case 'intermediateEventMultiple':
                 xml = `    <serviceTask id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </serviceTask>`; break;
-
             default:
                 xml = `    <task id="${sid}" name="${xmlEscape(step.name)}">\n${incoming}\n${outgoing}\n    </task>`;
         }
         return xml;
     }).join('\n');
+
+    // ── ANOTACIONES (textAnnotation + association) ────────────────────────────
+    const annotationElements = [];
+    steps.forEach(step => {
+        if (!step.annotation) return;
+        const annId  = `Ann_${pid(step.id)}`;
+        const assocId = `Assoc_${pid(step.id)}`;
+        // El separador " | " divide rol de campos — renderizar como líneas separadas
+        const annText = step.annotation.replace(/\s*\|\s*/g, '\n');
+        annotationElements.push(
+            `    <textAnnotation id="${annId}">\n      <text>${xmlEscape(annText)}</text>\n    </textAnnotation>`,
+            `    <association id="${assocId}" sourceRef="${sid(step)}" targetRef="${annId}"/>`
+        );
+    });
+
+    // helper local para sid en anotaciones
+    function sid(step) { return `${pfx}${step.id}`; }
 
     const sequences = steps.flatMap(step =>
         (step.next || []).map(targetId => {
@@ -123,6 +126,7 @@ function generateLogic(structure, processId, lanePrefix = '') {
 ${lanes}
     </laneSet>
 ${elements}
+${annotationElements.join('\n')}
 ${sequences}
   </process>`;
 }
@@ -150,7 +154,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     const nw = t => NODE_W[t] ?? 90;
     const nh = t => NODE_H[t] ?? 60;
 
-    const isSmall  = t => NODE_W[t] === 30 || NODE_W[t] === 40;
     const isCircle = t => ['startEvent','endEvent','endEventMessage',
                            'intermediateEvent','intermediateEventMessage'].includes(t);
     const isGW     = t => t?.includes('Gateway');
@@ -195,9 +198,6 @@ function generateDI(structure, processId, poolOpts = {}) {
     steps.forEach(s => { stepMap[s.id] = s; });
 
     // ── PASO 1: Asignar columnas (BFS por lane) ──────────────────────────────
-    // ✅ FIX 2: Se incluyen también las aristas cross-lane al calcular inDeg.
-    // Esto evita que nodos que reciben de otro lane tengan inDeg=0 dentro del lane
-    // y compitan con el bridge (EvtBr_) por la columna 0, causando superposición.
     const nodeCol = {};
     steps.forEach(s => { nodeCol[s.id] = 0; });
 
@@ -206,7 +206,6 @@ function generateDI(structure, processId, poolOpts = {}) {
         if (!ls.length) return;
         const laneIds = new Set(ls.map(s => s.id));
 
-        // Detectar back-edges con DFS
         const backEdges = new Set();
         const mark = {};
         const dfs = id => {
@@ -221,11 +220,9 @@ function generateDI(structure, processId, poolOpts = {}) {
         };
         ls.forEach(s => { if (!mark[s.id]) dfs(s.id); });
 
-        // BFS para asignar columnas
         const inDeg = {};
         ls.forEach(s => { inDeg[s.id] = 0; });
 
-        // Aristas intra-lane
         ls.forEach(s => {
             (s.next || []).forEach(nid => {
                 if (laneIds.has(nid) && !backEdges.has(`${s.id}->${nid}`))
@@ -233,11 +230,8 @@ function generateDI(structure, processId, poolOpts = {}) {
             });
         });
 
-        // ✅ FIX 2: Aristas cross-lane (entrantes desde otros lanes)
-        // Un nodo que recibe una arista de otro lane ya tiene "algo antes",
-        // por lo que su inDeg debe ser >= 1 para no quedar en col=0 junto al bridge.
         steps.forEach(s => {
-            if (laneIds.has(s.id)) return; // solo nodos externos al lane
+            if (laneIds.has(s.id)) return;
             (s.next || []).forEach(nid => {
                 if (laneIds.has(nid))
                     inDeg[nid] = (inDeg[nid] || 0) + 1;
@@ -260,6 +254,37 @@ function generateDI(structure, processId, poolOpts = {}) {
         }
         const maxC = Math.max(0, ...ls.map(s => nodeCol[s.id] || 0));
         ls.forEach(s => { if (!visited.has(s.id)) nodeCol[s.id] = maxC + 1; });
+
+        // POST-BFS: resolver encimamientos en la misma columna dentro del lane.
+        // Si hay un intermediateEvent (bridge de entrada) en col=0 junto a otros nodos
+        // también en col=0, el bridge siempre va a col=0 y los demás se desplazan.
+        const col0Nodes = ls.filter(s => (nodeCol[s.id] || 0) === 0);
+        if (col0Nodes.length > 1) {
+            const bridgeInLane = col0Nodes.find(s => s.type === 'intermediateEvent');
+            if (bridgeInLane) {
+                // El bridge se queda en col 0; todos los demás en col 0 pasan a col 1+
+                col0Nodes.forEach(s => {
+                    if (s.id !== bridgeInLane.id) {
+                        nodeCol[s.id] = 1;
+                        // Propagar el desplazamiento en el grafo del lane
+                        const q2 = [s.id]; const vis2 = new Set([bridgeInLane.id]);
+                        while (q2.length) {
+                            const cid = q2.shift();
+                            if (vis2.has(cid)) continue;
+                            vis2.add(cid);
+                            (stepMap[cid]?.next || []).forEach(nid => {
+                                if (!laneIds.has(nid) || vis2.has(nid)) return;
+                                const nc2 = (nodeCol[cid] || 0) + 1;
+                                if (nc2 > (nodeCol[nid] || 0)) {
+                                    nodeCol[nid] = nc2;
+                                    q2.push(nid);
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        }
     });
 
     // ── PASO 2: Asignar filas ─────────────────────────────────────────────────
@@ -321,13 +346,20 @@ function generateDI(structure, processId, poolOpts = {}) {
         laneRowCount[role] = ls.length ? Math.max(1, ...ls.map(s => (nodeRow[s.id] || 0) + 1)) : 1;
     });
 
+    // Calcular altura real necesaria considerando la posición Y máxima de
+    // cualquier nodo dentro del lane (cy + h/2 + LANE_PAD_BOT).
+    // Esto evita que nodos en fila secundaria (row > 0) queden encimados
+    // con el siguiente lane.
     const laneH = {}, laneY = {};
     let curY = POOL_Y;
     roles.forEach((role, ri) => {
         const rows = laneRowCount[role] || 1;
-        const h = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 45 + LANE_PAD_BOT;
-        laneH[ri]   = Math.max(LANE_MIN_H, h);
-        laneY[ri]   = curY;
+        // Altura base por filas
+        const baseH = LANE_PAD_TOP + (rows - 1) * ROW_GAP + 45 + LANE_PAD_BOT;
+        // Margen extra de seguridad cuando hay más de 1 fila (nodos desplazados)
+        const safetyH = rows > 1 ? (rows - 1) * 25 : 0;
+        laneH[ri] = Math.max(LANE_MIN_H, baseH + safetyH);
+        laneY[ri] = curY;
         curY += laneH[ri];
     });
     const poolH = curY - POOL_Y;
@@ -382,6 +414,27 @@ function generateDI(structure, processId, poolOpts = {}) {
         if (!p) return;
         shapes += `      <bpmndi:BPMNShape id="Shape_${npid(s.id)}" bpmnElement="${npid(s.id)}">
         <dc:Bounds x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}"/>
+      </bpmndi:BPMNShape>\n`;
+    });
+
+    // ── SHAPES de anotaciones ─────────────────────────────────────────────────
+    steps.forEach(s => {
+        if (!s.annotation) return;
+        const p = P(s.id);
+        if (!p) return;
+        const annId = `Ann_${npid(s.id)}`;
+        // Contar líneas lógicas: separador | divide rol de campos
+        const parts = s.annotation.split('|');
+        const totalLen = s.annotation.length;
+        // Tamaño de caja según cantidad de contenido
+        const annW = totalLen > 60 ? 200 : totalLen > 40 ? 160 : 110;
+        const lineCount = parts.length + (totalLen > 80 ? 1 : 0);
+        const annH = lineCount >= 2 ? 55 : totalLen > 30 ? 42 : 30;
+        // Posicionar la anotación arriba del nodo
+        const annX = Math.round(p.cx - annW / 2);
+        const annY = Math.round(p.y - annH - 18);
+        shapes += `      <bpmndi:BPMNShape id="${annId}_di" bpmnElement="${annId}">
+        <dc:Bounds x="${annX}" y="${annY}" width="${annW}" height="${annH}"/>
       </bpmndi:BPMNShape>\n`;
     });
 
@@ -461,13 +514,6 @@ function generateDI(structure, processId, poolOpts = {}) {
                             [srcCX, BOT(step.id)],
                             [srcCX, T(targetId)],
                         ];
-                    } else if (tgtCX < srcCX - 30) {
-                        pts = [
-                            [srcCX, BOT(step.id)],
-                            [srcCX, midGapY],
-                            [tgtCX, midGapY],
-                            [tgtCX, T(targetId)],
-                        ];
                     } else {
                         pts = [
                             [srcCX, BOT(step.id)],
@@ -504,11 +550,28 @@ ${wpt(pts)}
         });
     });
 
+    // ── EDGES de asociaciones de anotaciones ──────────────────────────────────
+    steps.forEach(s => {
+        if (!s.annotation) return;
+        const p = P(s.id);
+        if (!p) return;
+        const assocId = `Assoc_${npid(s.id)}`;
+        const annId   = `Ann_${npid(s.id)}`;
+        const annW    = s.annotation.length > 40 ? 160 : 100;
+        const annH    = s.annotation.length > 40 ? 60  : 36;
+        const annCX   = Math.round(p.cx);
+        const annBotY = Math.round(p.y - 20);
+        edges += `      <bpmndi:BPMNEdge id="${assocId}_di" bpmnElement="${assocId}">
+        <di:waypoint x="${annCX}" y="${annBotY}"/>
+        <di:waypoint x="${p.cx}" y="${p.y}"/>
+      </bpmndi:BPMNEdge>\n`;
+    });
+
     return { poolH, shapesXml: shapes, edgesXml: edges };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// buildPrompt
+// buildPrompt — con los 3 cambios solicitados
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPrompt(text) {
     return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
@@ -526,16 +589,78 @@ Antes de escribir el [MD_START] o el [JSON_START], haz lo siguiente:
 5. Solo cuando tengas el inventario completo, comienza a escribir la respuesta.
 
 ═══════════════════════════════════════════════════════════
-FILOSOFÍA: MENOS ES MÁS
+FILOSOFÍA: MENOS ES MÁS, PERO COMPLETO
 ═══════════════════════════════════════════════════════════
-El diagrama debe comunicar el PROPÓSITO de cada sección, no documentar cada clic de la interfaz.
-Un director debe leerlo y entender el flujo en 30 segundos.
+El diagrama debe comunicar el PROPÓSITO y el FLUJO COMPLETO de cada sección.
+Un director debe leerlo y entender exactamente qué hace el usuario en cada paso.
 
 ANTES DE ESCRIBIR CADA TAREA, hazte esta pregunta:
   "¿Qué LOGRA el usuario en este paso?" → eso es el nombre de la tarea.
   "¿Cómo hace clic en la pantalla?" → eso NO va en el diagrama.
 
+Los procesos deben ser COMPLETOS — incluir todas las acciones relevantes que
+el usuario realiza: acceder a una sección, buscar o filtrar registros, seleccionar
+un elemento, ingresar datos, confirmar, generar documentos, etc.
+No omitir pasos solo por simplificar — si el manual lo menciona, debe estar.
+
 ═══════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
+REGLA 0 — ROLES: UN POOL POR SISTEMA, ANOTACIÓN POR SECCIÓN (CRÍTICO)
+═══════════════════════════════════════════════════════════
+PRINCIPIO FUNDAMENTAL — UN POOL POR SISTEMA:
+  Aunque el manual describa múltiples roles o perfiles (Brigadista, Director
+  de Área, Coordinador Estatal, Administrador, etc.), el diagrama debe tener
+  UN SOLO POOL por sistema o aplicación.
+
+  Los roles se indican mediante ANOTACIONES en los nodos relevantes del diagrama.
+  Esto hace el diagrama más limpio, compacto y fácil de presentar.
+
+ESTRUCTURA CORRECTA para sistema con múltiples roles:
+  → UN pool: nombre del sistema (sin mencionar roles en el nombre del pool)
+  → Cada lane: nombre del módulo o sección (no el nombre del rol)
+  → Anotación en el primer nodo de cada lane: indica qué rol(es) acceden
+
+  EJEMPLO CORRECTO — Herramienta con 3 roles (Brigadista, Director, Coordinador):
+    Pool: "Herramienta Brigadista"
+    Lane "Inicio de sesión":
+      Task "Ingresar credenciales" → annotation: "Brigadista · Director de Área · Coordinador Estatal"
+    Lane "Gestión de usuarios":
+      intermediateEvent → annotation: "Rol: Brigadista"
+    Lane "Aprobar solicitudes":
+      intermediateEvent → annotation: "Rol: Director de Área · Coordinador Estatal"
+    Lane "Reportes":
+      intermediateEvent → annotation: "Rol: Coordinador Estatal"
+
+  EJEMPLO INCORRECTO — Crear un pool por rol:
+    Pool 1 "Herramienta Brigadista - Brigadista"    ← INCORRECTO
+    Pool 2 "Herramienta Brigadista - Director"       ← INCORRECTO
+    Pool 3 "Herramienta Brigadista - Coordinador"    ← INCORRECTO
+
+DÓNDE AGREGAR LA ANOTACIÓN DE ROL:
+  • En el lane de inicio de sesión: en Task "Ingresar credenciales",
+    listar TODOS los roles del sistema separados por " · "
+    Ejemplo: annotation: "Brigadista · Director de Área · Coordinador Estatal"
+  • En cada lane de módulo: en el intermediateEvent de entrada del lane,
+    indicar el/los roles con acceso. Formato: "Rol: NombreRol"
+    Si aplica a todos los roles → no agregar anotación de rol
+    Si aplica a un rol específico → "Rol: Brigadista"
+    Si aplica a varios pero no todos → "Rol: Director · Coordinador"
+
+EXCEPCIÓN — Cuándo sí crear múltiples pools:
+  Solo cuando el manual describe APLICACIONES O SISTEMAS COMPLETAMENTE DISTINTOS
+  (ej: "Portal Ciudadano" y "Herramienta Brigadista" son apps diferentes → 2 pools).
+  Distintos roles dentro del MISMO sistema → siempre un solo pool con anotaciones.
+
+CÓMO IDENTIFICAR ROLES EN EL MANUAL:
+  • Lee todos los encabezados y secciones buscando perfiles de usuario
+  • Usa los nombres exactos del manual: "Responsable de Bienes", "Jefe de Área", etc.
+  • PROHIBIDO: "Usuario", "Actor", "Persona", "Rol 1" — siempre nombres reales del manual
+  • Si el manual no distingue roles → no agregar anotación de rol
+
+NOMBRE DEL POOL: nombre del sistema o aplicación, sin mencionar roles.
+  ✅ "Portal de Credencialización" · "Herramienta Brigadista" · "SICSSE - Activos Fijos"
+  ❌ "Herramienta Brigadista - Brigadista" · "Portal - Director de Área"
+
 REGLA 1 — NOMBRES DE TAREAS: CONCISOS Y DESCRIPTIVOS
 ═══════════════════════════════════════════════════════════
 Máximo 4 palabras por nombre. Corto pero que se entienda el objetivo.
@@ -555,48 +680,139 @@ Máximo 4 palabras por nombre. Corto pero que se entienda el objetivo.
   ❌ "Visualizar las opciones disponibles en el menú principal"
   ✅ "Acceso a menú principal"
 
-Verbos preferidos: Ingresar · Validar · Confirmar · Seleccionar · Crear · Editar · Buscar · Registrar · Cerrar · Acceder · Generar · Enviar
+Verbos preferidos: Ingresar · Validar · Confirmar · Seleccionar · Crear · Editar
+                   Buscar · Filtrar · Registrar · Cerrar · Acceder · Generar
+                   Enviar · Descargar · Consultar · Adjuntar · Revisar
 
 PROHIBIDO: Presionar · Pulsar · Tocar · Dar clic · Hacer clic · Botón · Ícono
 
-ANTI-PATRÓN — Secuencias técnicas repetitivas (muy común en sistemas con envío a SAJ o similar):
-  El manual describe: "guardar borrador", "enviar al sistema", "reintentar si falla", "recibir confirmación", "ver número de inventario"
-  Estos 5 pasos siempre ocurren igual en todos los módulos → consolidar en 2 tareas máximo:
+ANTI-PATRÓN — Secuencias técnicas repetitivas:
+  Consolidar "guardar borrador", "enviar al sistema", "reintentar si falla",
+  "recibir confirmación" en máximo 2 tareas:
     "Registrar solicitud" + Gateway(¿Exitoso?) → "Recibir confirmación" / "Reintentar envío"
-  No repetir esta secuencia idéntica en cada módulo del manual.
 
 ═══════════════════════════════════════════════════════════
-REGLA 2 — POOLS Y LANES (OBLIGATORIA)
+REGLA 1B — PROCESOS COMPLETOS POR SECCIÓN (NUEVO - CRÍTICO)
+═══════════════════════════════════════════════════════════
+Cada lane de módulo debe incluir TODAS las acciones que el usuario realiza
+en esa sección, en el nivel correcto de abstracción:
+
+  ✅ NIVEL CORRECTO — acciones funcionales completas:
+     "Acceder a sección X"
+     "Buscar por [criterio del manual: CURP, nombre, folio, fecha…]"
+     "Filtrar resultados"
+     "Seleccionar registro"
+     "Completar formulario"
+     "Adjuntar documentos"
+     "Confirmar y guardar"
+     "Generar reporte / comprobante"
+     "Descargar documento"
+
+  ❌ DEMASIADO DETALLADO (nivel de interfaz — prohibido):
+     "Presionar el botón Buscar"
+     "Se desplegará una lista con los resultados"
+     "Hacer clic en el ícono de lupa"
+
+  ❌ DEMASIADO RESUMIDO (omite pasos importantes):
+     Un solo nodo "Gestionar dependientes" cuando el manual describe:
+     acceder, buscar, seleccionar, ingresar CURP, verificar, agregar, confirmar.
+
+REGLA DE ORO: Si el manual dedica un párrafo o más a describir los pasos
+de una acción dentro de un módulo, esa acción merece su propio nodo en el diagrama.
+Si solo menciona la acción de pasada en una línea, puede ir agrupada.
+
+═══════════════════════════════════════════════════════════
+REGLA 2 — ANOTACIONES: CAMPOS DE FORMULARIO Y ROLES DE ACCESO (NUEVO)
+═══════════════════════════════════════════════════════════
+El campo "annotation" en un step sirve para DOS propósitos:
+  1. Indicar los CAMPOS de un formulario que el usuario debe llenar
+  2. Indicar el ROL o roles que tienen acceso a esa sección
+
+── TIPO A: Anotación de CAMPOS DE FORMULARIO ──────────────────────────────────
+Agregar en userTask que involucra ingreso de datos.
+
+CUÁNDO agregar:
+  • userTask de login, registro, búsqueda, formularios
+  • Cuando el manual menciona campos específicos que el usuario ingresa
+
+CUÁNDO NO agregar:
+  • Gateways, eventos, scriptTask, tareas de solo confirmación
+  • Cuando el manual no especifica campos concretos
+
+FORMATO:
+  • 1-3 campos cortos → separados por " · "  →  "CURP · Contraseña"
+  • 4-6 campos → igual formato  →  "Nombre · CURP · Correo · Teléfono · Estado"
+  • Más de 6 → agrupar por categoría  →  "Datos personales · Datos de contacto"
+  • Solo campos mencionados explícitamente en el manual. NUNCA inventar campos.
+
+── TIPO B: Anotación de ROL DE ACCESO ─────────────────────────────────────────
+Agregar cuando el manual tiene múltiples roles y una sección es exclusiva de uno.
+
+CUÁNDO agregar:
+  • En Task "Ingresar credenciales" del login: listar TODOS los roles del sistema
+  • En el intermediateEvent de entrada de cada lane de módulo: indicar rol(es)
+    que tienen acceso, cuando NO todos los roles del sistema acceden a ese módulo
+
+CUÁNDO NO agregar anotación de rol:
+  • Si el módulo es accesible por TODOS los roles del sistema → no agregar
+  • Si el manual solo tiene un rol → no agregar
+
+FORMATO de anotación de rol:
+  • Todos los roles (en login):  "Brigadista · Director de Área · Coordinador Estatal"
+  • Un rol específico:  "Rol: Brigadista"
+  • Varios roles específicos:  "Rol: Director de Área · Coordinador Estatal"
+
+── COMBINACIÓN: un step puede tener campos Y rol ──────────────────────────────
+Si un step tiene tanto campos como restricción de rol, el annotation combina ambos:
+  "Rol: Brigadista | CURP · Nombre · Correo"
+  (separar con " | " para distinguir rol de campos)
+
+EJEMPLOS:
+
+Step de login con anotación de roles (todos los roles):
+  {"id":"Task_Login","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión","next":["Script_Val"],"annotation":"Brigadista · Director de Área · Coordinador Estatal | Usuario · Contraseña"}
+
+Step de formulario con campos (solo campos, módulo accesible por todos):
+  {"id":"Task_Reg","name":"Completar formulario","type":"userTask","role":"Registro","next":["GW_Val"],"annotation":"Nombre · Apellidos · CURP · Fecha nacimiento · Correo"}
+
+Step de entrada de módulo con rol específico:
+  {"id":"Evt_Aprobar","name":"Aprobar solicitudes","type":"intermediateEvent","role":"Aprobar solicitudes","next":["Task_Revisar"],"annotation":"Rol: Director de Área · Coordinador Estatal"}
+
+Step sin anotación (gateway):
+  {"id":"GW_Val","name":"¿Datos válidos?","type":"exclusiveGateway","role":"Registro","next":["End_Error","Task_Confirm"],"conditions":{"End_Error":"No","Task_Confirm":"Sí"}}
+
+═══════════════════════════════════════════════════════════
+REGLA 3 — POOLS Y LANES (OBLIGATORIA)
 ═══════════════════════════════════════════════════════════
 UN POOL = un actor, sistema o proceso diferenciado en el manual.
 El campo "pools" del JSON define cuántos diagramas se generarán — uno por pool.
 
 CUÁNDO crear múltiples pools:
-  • El manual describe N actores distintos (ciudadano, técnico, admin, brigadista…)
-  • El manual tiene secciones claramente independientes (Alta, Baja, Modificación…)
-  • El manual tiene capítulos que son procesos separados aunque usen el mismo sistema
-  → Un pool por cada actor o proceso independiente. Sin límite — puede ser 1, 2, 3, 4 o más.
+  SOLO cuando el manual describe SISTEMAS O APLICACIONES COMPLETAMENTE DISTINTOS.
+  Ejemplo: "Portal Ciudadano" y "Herramienta Brigadista" son aplicaciones
+  diferentes → sí merecen pools separados.
 
-  REGLA CLAVE — pool vs lane:
-  Un POOL nuevo solo se justifica cuando hay un LOGIN DIFERENTE o un USUARIO DIFERENTE.
-  Si varios módulos comparten el mismo login/menú → son LANES del mismo pool, no pools distintos.
+  REGLA CLAVE — pool vs lane vs anotación:
+  • Distintas APLICACIONES/SISTEMAS → pools separados
+  • Distintos MÓDULOS del mismo sistema → lanes del mismo pool
+  • Distintos ROLES dentro del mismo sistema → UN pool + anotaciones de rol en cada lane
 
-  Ejemplo CORRECTO para manual SICSSE (Altas + Bajas, mismo sistema, mismo login):
-    Pool 1 "SICSSE - Altas": login + Alta Compras Mayores + Alta Compras Menores + ... + logout
-    Pool 2 "SICSSE - Bajas": login + Baja por Desuso + Baja por Siniestro + logout
-    → 2 pools porque Altas y Bajas son procesos claramente separados en el manual.
+  EJEMPLO CORRECTO — mismo sistema, múltiples roles:
+    Pool único: "Herramienta Brigadista"
+    Lanes: "Inicio de sesión" · "Gestión usuarios" · "Aprobar solicitudes" · "Cerrar sesión"
+    → Los roles se indican en anotaciones, NO en pools separados.
 
-  Ejemplo INCORRECTO (sobre-fragmentación):
-    Pool 1 "Alta Compras Mayores" (con su propio login)
-    Pool 2 "Alta Compras Menores" (con su propio login)  ← INCORRECTO: mismo login
-    → Estos son LANES de un mismo pool "SICSSE - Altas", no pools distintos.
+  EJEMPLO INCORRECTO:
+    Pool 1 "Herramienta Brigadista - Brigadista"
+    Pool 2 "Herramienta Brigadista - Director de Área"
+    → NUNCA crear un pool por cada rol del mismo sistema.
 
 CUÁNDO crear un solo pool:
-  • Solo hay un actor usando el sistema
-  • Todas las secciones son módulos del mismo menú del mismo usuario
+  • Siempre que todos los módulos pertenezcan al mismo sistema/aplicación,
+    sin importar cuántos roles distintos tenga ese sistema.
 
-NOMBRE DEL POOL: nombre real del sistema, rol o proceso. Ejemplos:
-  "Portal Ciudadano" · "Herramienta Brigadista" · "Bienes Técnicos - Altas" · "Bienes Técnicos - Bajas"
+NOMBRE DEL POOL: nombre real del sistema + rol exacto del manual. Ejemplos:
+  "Portal Ciudadano" · "Herramienta Brigadista" · "SICSSE - Responsable de Bienes"
   PROHIBIDO: "Proceso de Negocio", "Pool 1", "Pool A", nombres genéricos.
 
 ESTRUCTURA DE LANES dentro de cada pool:
@@ -605,355 +821,197 @@ ESTRUCTURA DE LANES dentro de cada pool:
   3. Último lane: cierre de sesión
 
 LANE DE INICIO DE SESIÓN — ESTRUCTURA FIJA (OBLIGATORIA):
-  El lane de inicio de sesión tiene EXACTAMENTE estos 7 nodos, ni uno más ni uno menos:
+  El lane de inicio de sesión tiene EXACTAMENTE estos 7 nodos — ni uno más, ni uno menos.
 
     startEvent("Inicio de sesión")
-    → userTask("Ingresar credenciales")
+    → userTask("Ingresar credenciales") [annotation: "Usuario · Contraseña" o campos reales del manual]
     → scriptTask("Validar acceso")
     → exclusiveGateway("¿Acceso correcto?")
         → [No]  endEvent("Acceso fallido")
         → [Sí]  userTask("Acceso a ventana principal")
-                → intermediateEventMultiple("Menú principal")  ← hub que distribuye a todos los módulos
+                → intermediateEventMultiple("Menú principal")
 
-  ❌ PROHIBIDO en el lane de inicio de sesión:
-     • Añadir recuperación de contraseña aquí — tiene su propio lane separado
-     • Añadir validación de sesión previa, captcha, 2FA u otros pasos extra
-     • Añadir más de 1 gateway
+  ❌ PROHIBIDO ABSOLUTAMENTE en el lane de inicio de sesión:
+     • Agregar módulos del sistema (importación, consulta, registro, etc.)
      • Superar los 7 nodos bajo ninguna circunstancia
-     • Poner el intermediateEventMultiple antes del userTask "Acceso a ventana principal"
+     • Los módulos siempre van en su propio lane separado
 
-  El intermediateEventMultiple es el ÚNICO punto de salida hacia todos los módulos.
-  Sus "next" deben incluir el intermediateEvent de entrada de CADA lane de módulo,
-  más el intermediateEvent del lane de cierre de sesión.
+  ❌ PROHIBIDO: crear lanes sin ningún nodo (lanes vacíos).
+     Si un módulo no tiene pasos claros en el manual → omitirlo, no crear lane vacío.
 
 ⚠️ NOMBRES DE LANES — REGLA CRÍTICA:
   Cada lane en todo el JSON debe tener un nombre ÚNICO en todo el documento.
-  Si dos pools tienen un lane de login, NO pueden llamarse igual.
-  Usa el nombre del actor como sufijo: "Inicio de sesión Ciudadano", "Inicio de sesión Brigadista"
-  Lo mismo para "Cerrar sesión": "Cerrar sesión Ciudadano", "Cerrar sesión Brigadista"
-
-  ❌ PROHIBIDO (nombres duplicados entre pools):
-     Pool 1: ["Inicio de sesión", "Módulo A", "Cerrar sesión"]
-     Pool 2: ["Inicio de sesión", "Módulo B", "Cerrar sesión"]  ← INCORRECTO
-
-  ✅ CORRECTO (nombres únicos):
-     Pool 1: ["Inicio de sesión Ciudadano", "Módulo A", "Cerrar sesión Ciudadano"]
-     Pool 2: ["Inicio de sesión Brigadista", "Módulo B", "Cerrar sesión Brigadista"]
+  Usa el nombre del actor/rol como sufijo si hay ambigüedad:
+  "Inicio de sesión Ciudadano", "Inicio de sesión Brigadista"
+  "Cerrar sesión Ciudadano", "Cerrar sesión Brigadista"
 
 LANE DE CIERRE — reglas especiales:
-  • Máximo 2-3 nodos: un intermediateEvent de entrada + 1 tarea + endEvent
-  • NUNCA un startEvent en el lane de cierre — siempre recibe desde el menú
-  • Ejemplo: Evt_CerrarSesion → Task_ConfirmarCierre → End_Sesion
-
-Cada pool tiene su propio startEvent. NUNCA conectar nodos entre pools distintos.
+  • Máximo 2-3 nodos: intermediateEvent + 1 tarea + endEventTerminate
+  • NUNCA un startEvent en el lane de cierre
 
 SUB-FASES DE MÓDULOS:
-  Cuando un módulo describe etapas claramente diferenciadas en el manual
-  (Registro, Seguimiento, Documentos, Aprobación, Envío SAJ…), cada etapa
+  Cuando un módulo describe etapas claramente diferenciadas, cada etapa
   con pasos propios merece su propio lane.
-  Si la etapa tiene solo 1-2 pasos genéricos, consérvala unida al lane principal.
 
 ═══════════════════════════════════════════════════════════
-REGLA 3 — CANTIDAD DE NODOS POR LANE (LÍMITE ESTRICTO)
+REGLA 4 — CANTIDAD DE NODOS POR LANE (LÍMITE ESTRICTO)
 ═══════════════════════════════════════════════════════════
 MÁXIMO ABSOLUTO: 7 nodos por lane. Este límite es INVIOLABLE.
-Objetivo ideal: entre 3 y 5 nodos por lane.
+Objetivo ideal: entre 4 y 6 nodos por lane (suficiente para mostrar el proceso completo).
 
-ANTES de escribir el JSON, cuenta los nodos de cada lane mentalmente.
-Si llegas a 7 y aún tienes pasos pendientes → PARA y divide en Parte 1 / Parte 2.
+NOTA: El límite de 7 no significa que debas reducir a 3. Un proceso completo
+puede necesitar 5-6 nodos y eso es correcto y deseable.
 
-CÓMO RESPETAR EL LÍMITE — consolidar pasos relacionados en una sola tarea:
+CÓMO RESPETAR EL LÍMITE — consolidar solo cuando sea necesario:
 
-  Patrón FORMULARIO (muy común en sistemas):
-    Manual: "ingresar nombre", "ingresar CURP", "ingresar correo", "ingresar teléfono"
-    Diagrama: UNA tarea "Completar formulario" o "Ingresar datos"
-    NUNCA una tarea por cada campo del formulario.
+  Patrón FORMULARIO (varios campos del mismo formulario):
+    Manual: "ingresar nombre", "ingresar CURP", "ingresar correo"
+    Diagrama: UNA tarea "Completar formulario" + annotation con los campos
 
-  Patrón VALIDACIÓN:
-    Manual: "el sistema valida formato, verifica en BD, comprueba duplicados, muestra resultado"
+  Patrón VALIDACIÓN TÉCNICA:
+    Manual: "el sistema valida formato, verifica en BD, comprueba duplicados"
     Diagrama: UNA tarea "Validar datos"
 
-  Patrón DESCARGA/GENERACIÓN:
-    Manual: "el sistema genera el archivo", "muestra vista previa", "el usuario descarga"
+  Patrón DESCARGA:
+    Manual: "el sistema genera el archivo", "el usuario descarga"
     Diagrama: UNA tarea "Generar y descargar documento"
 
-  Patrón CONFIRMACIÓN:
-    Manual: "el sistema muestra resumen", "el usuario revisa", "el usuario confirma", "el sistema guarda"
-    Diagrama: UNA tarea "Confirmar y guardar"
-
-MÓDULOS SIMILARES (misma app, distintas categorías):
-  Cuando el manual describe módulos parecidos (Alta Mayores, Alta Menores, Alta Compra Directa),
-  cada lane debe mostrar lo DIFERENTE y ÚNICO de ese módulo.
-  No copiar los mismos 8 pasos genéricos en cada lane — eso no aporta valor al diagrama.
-  Captura el propósito distintivo en 3-5 pasos concretos.
-
 ═══════════════════════════════════════════════════════════
-REGLA 4 — FLUJO ENTRE SECCIONES Y CONECTIVIDAD OBLIGATORIA
+REGLA 5 — FLUJO ENTRE SECCIONES Y CONECTIVIDAD OBLIGATORIA
 ═══════════════════════════════════════════════════════════
 
 REGLA FUNDAMENTAL — Todos los nodos deben estar conectados:
-  • Todo nodo DEBE tener al menos 1 entrada (aparecer en el "next" de algún nodo previo),
-    EXCEPTO los startEvent que son el punto de origen.
-  • Todo nodo DEBE tener al menos 1 salida en su propio "next",
-    EXCEPTO los endEvent y endEventMessage que terminan el flujo.
-  • Un nodo sin entrada es un nodo HUÉRFANO → el diagrama estará roto en Bizagi.
-  • Un nodo sin salida (que no sea endEvent) es un nodo MUERTO → el flujo no avanza.
+  • Todo nodo DEBE tener al menos 1 entrada (excepto startEvent).
+  • Todo nodo DEBE tener al menos 1 salida (excepto endEvent y variantes).
+  • Un nodo sin entrada es un nodo HUÉRFANO → diagrama roto en Bizagi.
 
 CÓMO CONECTAR LANES CORRECTAMENTE:
   El último nodo activo del lane A apunta al intermediateEvent que inicia el lane B.
   El intermediateEvent del lane B apunta a la primera tarea del lane B.
 
-  ✅ CORRECTO:
-     Lane A: ... → Task_UltimaAccion (next: ["Evt_InicioB"])
-     Lane B: Evt_InicioB (next: ["Task_PrimeraB"]) → Task_PrimeraB → ... → End_LaneB
-
-  ❌ INCORRECTO — intermediateEvent huérfano (nadie apunta a él):
-     Lane A: ... → Task_UltimaAccion (next: ["End_LaneA"])   ← cierra mal con endEvent
-     Lane B: Evt_InicioB (next: ["Task_PrimeraB"])            ← Evt_InicioB no tiene entrada
-
-  ❌ INCORRECTO — endEvent con salida:
-     { "id":"End_A", "type":"endEvent", "next":["Evt_B"] }   ← PROHIBIDO siempre
-
 MENÚ QUE DISTRIBUYE A VARIOS MÓDULOS:
-  Task_Menu → "next": ["Evt_ModA", "Evt_ModB", "Evt_CerrarSesion"]
-  Cada Evt_Mod recibe la flecha del menú y arranca su propio flujo.
-  Cada módulo termina en su propio endEvent independiente.
-  No hay regreso al menú desde ningún módulo.
+  intermediateEventMultiple → "next": ["Evt_ModA", "Evt_ModB", ..., "Evt_CerrarSesion"]
 
-MÓDULO CON SUB-OPCIONES dentro del mismo lane:
-  Evt_Modulo → Gateway_TipoAccion → ["Task_OpcionA", "Task_OpcionB"]
-  Cada opción termina en su propio endEvent dentro del mismo lane.
+REGLA ANTI-BUCLE:
+  Los bucles/reintentos se modelan con endEvent descriptivo, no con flechas de regreso.
 
-REGLA ANTI-BUCLE — Cómo manejar flujos de error o reintento:
-  Cuando el manual dice "si la CURP ya existe, repita el paso B", "si falla, intente de nuevo"
-  o cualquier redirección de regreso a un paso anterior → NO conectar de vuelta.
-
-  La razón es técnica: los bucles en BPMN rompen el layout en Bizagi y confunden al lector.
-  En su lugar, terminar ese camino con un endEvent con nombre descriptivo del motivo.
-
-  ✅ CORRECTO — Camino de error termina con endEvent descriptivo:
-     GW_ValidarCURP → [Sí] → Task_ConfirmarDatos → ...
-                    → [No] → End_CurpDuplicada
-
-  ✅ CORRECTO — Reintento modelado como gateway:
-     Task_EnviarSolicitud → GW_Enviado → [Sí] → Task_RecibirConfirmacion → End_OK
-                                        → [No] → Task_ReintentarEnvio → End_FalloEnvio
-
-  ❌ INCORRECTO — Bucle explícito (PROHIBIDO):
-     GW_ValidarCURP → [No] → Task_IngresarCURP   ← regresa a nodo anterior
-
-VERIFICACIÓN OBLIGATORIA antes de escribir el JSON:
-  Para cada step, confirmar:
-  1. ¿Aparece en el "next" de algún otro nodo? Si no → es huérfano, conectarlo.
-  2. Si es endEvent → "next": [] y listo.
-  3. Si es intermediateEvent → tiene exactamente 1 nodo que apunta a él y al menos 1 salida.
-  4. Si es exclusiveGateway → tiene mínimo 2 salidas y "conditions" completo.
-  5. ¿Existe algún ciclo A→B→A? → romperlo con endEvent descriptivo.
+VERIFICACIÓN antes de escribir el JSON:
+  □ ¿Cada step (no startEvent) aparece en el "next" de algún otro nodo?
+  □ ¿Todos los endEvent tienen "next": []?
+  □ ¿Ningún nodo apunta a un nodo de otro pool?
+  □ ¿Hay ciclos A→B→A? → romper con endEvent.
 
 ═══════════════════════════════════════════════════════════
-REGLA 5 — NO INVENTAR
+REGLA 6 — NO INVENTAR
 ═══════════════════════════════════════════════════════════
-Solo modela lo que el manual describe. Si algo no está claro → omítelo.
-  ❌ Gateways de selección de tipo de usuario — PROHIBIDO
-  ❌ Tareas o lanes no mencionados en el manual — PROHIBIDO
+Solo modela lo que el manual describe explícitamente.
+  ❌ Tareas, lanes o roles no mencionados en el manual — PROHIBIDO
+  ❌ Campos en "annotation" que el manual no menciona — PROHIBIDO
 
 ═══════════════════════════════════════════════════════════
-REGLA 6 — REGLAS TÉCNICAS Y TIPOS DE NODO
+REGLA 7 — REGLAS TÉCNICAS Y TIPOS DE NODO
 ═══════════════════════════════════════════════════════════
 • Un startEvent por tipo de usuario, en su primer lane.
 • IDs únicos sin espacios: Start_Xxx  Task_Xxx  GW_Xxx  Evt_Xxx  End_Xxx
-• Sin referencias circulares: A → B → A está prohibido.
+• Sin referencias circulares.
 • exclusiveGateway con más de una salida → campo "conditions" obligatorio.
 • steps[] en orden de flujo: startEvent primero.
 
-TIPOS DE NODO — definición y reglas de nombre:
-
-  startEvent:
-    Inicio del proceso (círculo verde en Bizagi).
-    Nombre CORTO, máximo 3 palabras. Describe el evento de inicio, no al actor.
-    ✅ "Inicio de sesión", "Pre-registro", "Inicio"
-    ❌ "Inicio del proceso de credencialización del ciudadano" — demasiado largo
-    ❌ "Inicio Ciudadano" — el actor ya está en el nombre del pool/lane
-
-  endEvent:
-    Fin simple. Usar para: errores de validación, cancelaciones, fin de búsqueda,
-    fin de sección sin notificación. "next": [] siempre.
-    ✅ "CURP inválida", "Acceso fallido", "Código inválido", "Búsqueda finalizada"
-    ❌ Nunca solo "Fin" — agrega contexto de qué terminó.
-
-  endEventMessage:
-    Fin con notificación al usuario (confirmación en pantalla, email, SMS).
-    Usar cuando la operación completada genera un mensaje de confirmación visible.
-    "next": [] siempre.
-    ✅ "Usuario creado", "Edición guardada", "Operación completada", "Pre-registro creado"
-    ❌ NO usar para errores ni para cierre de sesión.
-
-  endEventTerminate:
-    Fin que cierra el proceso COMPLETO. Usar EXCLUSIVAMENTE para cerrar sesión.
-    Cuando el usuario cierra sesión, el proceso termina por completo — usar este tipo.
-    "next": [] siempre.
-    ✅ "Sesión cerrada" (ÚNICO caso de uso)
-
-  endEventSignal:
-    Fin que dispara o notifica a otro proceso externo.
-    Usar cuando el resultado impacta un sistema externo o inicia otro proceso
-    (credencial generada que activa servicios de salud, registro que notifica a SAJ).
-    "next": [] siempre.
-    ✅ "Credencial generada", "Alta enviada a SAJ", "Registro completado en sistema"
-
-  userTask:
-    Acción visible que el usuario ejecuta en pantalla.
-    Verbo + objeto. ✅ "Ingresar credenciales", "Confirmar datos", "Adjuntar documento"
-
-  serviceTask:
-    Llamada automática a API o sistema externo (SAJ, RENAPO, etc.).
-    ✅ "Consultar CURP en RENAPO", "Enviar a SAJ"
-
-  scriptTask:
-    Validación o proceso interno del sistema, sin interacción del usuario.
-    ✅ "Validar formato CURP", "Verificar duplicados"
-
-  exclusiveGateway:
-    Decisión con 2 o más caminos. Nombre en forma de pregunta (máximo 5 palabras).
-    ✅ "¿CURP válida?", "¿Envío exitoso?", "¿Acepta términos?"
-    ❌ "Verificar si la CURP ingresada por el usuario es válida o no"
-    SIEMPRE incluir "conditions" con una etiqueta corta por destino:
-    Pares válidos: "Sí"/"No", "Válida"/"Inválida", "Exitoso"/"Fallido",
-                   "Aprobado"/"Rechazado", "Correcto"/"Incorrecto"
-
-  intermediateEvent:
-    Conector simple entre lanes/secciones. Exactamente 1 entrada y 1 salida.
-    Nombre = nombre del módulo o sección destino. Sin verbos "Iniciar", "Ir a", "Activar".
-    ✅ "Verificación de cuenta", "Mis dependientes", "Cerrar sesión", "Módulo Alta"
-    ❌ "Iniciar verificación de cuenta" — verbo innecesario
-    El nombre debe coincidir o resumir el nombre del lane al que pertenece.
-
-  intermediateEventMessage:
-    Notificación que ocurre DENTRO del flujo (no termina el proceso).
-    Usar cuando el sistema envía un mensaje al usuario y luego el flujo CONTINÚA.
-    ✅ "Enviar código verificación" (el flujo continúa esperando el código)
-    ✅ "Enviar alerta de error" (el flujo continúa con reintento)
-    ❌ NO usar si el proceso termina después — en ese caso usar endEventMessage.
-
-  intermediateEventMultiple:
-    Hub de menú principal. Usar EXCLUSIVAMENTE para el nodo que distribuye el flujo
-    a varios módulos a la vez (el menú principal después del login).
-    Tiene múltiples salidas (una por cada módulo disponible).
-    ✅ "Módulos", "Menú principal", "Menú principal Brigadista"
-    Solo debe haber 1 por pool, en el lane de inicio de sesión.
-    NOTA TÉCNICA: este nodo se renderiza como tarea de servicio (serviceTask) en el
-    diagrama final, lo que mejora su legibilidad cuando hay un solo hub de distribución.
+TIPOS DE NODO:
+  startEvent         → Inicio del proceso (círculo verde). Máximo 3 palabras.
+  endEvent           → Fin simple (errores, cancelaciones). "next": [] siempre.
+  endEventMessage    → Fin con notificación visible al usuario. "next": [] siempre.
+  endEventTerminate  → Fin de cierre de sesión ÚNICAMENTE. "next": [] siempre.
+  endEventSignal     → Fin que impacta sistema externo. "next": [] siempre.
+  userTask           → Acción del usuario en pantalla. Puede llevar "annotation".
+  serviceTask        → Llamada automática a API/sistema externo.
+  scriptTask         → Validación o proceso interno del sistema.
+  exclusiveGateway   → Decisión. Nombre en pregunta. "conditions" obligatorio.
+  intermediateEvent  → Conector entre lanes. Exactamente 1 entrada y 1 salida.
+  intermediateEventMessage → Notificación dentro del flujo (el flujo continúa).
+  intermediateEventMultiple → Hub del menú principal. 1 por pool.
 
 ═══════════════════════════════════════════════════════════
-REGLA 7 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
+REGLA 8 — MANUALES GRANDES (MÁS DE 5 MÓDULOS)
 ═══════════════════════════════════════════════════════════
-Cuando el manual describe muchos módulos similares (Alta, Baja, Modificación, consultas, etc.):
-
-1. ABSTRAE, NO COPIES:
-   El diagrama no es una transcripción del manual — es un resumen ejecutivo visual.
-   Si 3 módulos tienen el mismo flujo técnico, no dibujes 3 veces los mismos 8 pasos.
-   Cada lane debe capturar lo que lo hace DISTINTO: qué tipo de bien, qué validación especial,
-   qué autorización requiere, qué documentos genera.
-
-2. CUENTA NODOS ANTES DE ESCRIBIR:
-   Para cada lane, lista mentalmente los pasos, agrúpalos en tareas y verifica que no pasen de 7.
-   Si pasas de 7 al contar → consolida más antes de escribir el JSON.
-
-3. PASOS ADMINISTRATIVOS ESTÁNDAR → UN SOLO NODO:
-   "guardar borrador / preguardar / guardar temporalmente" → "Guardar borrador"
-   "enviar + reintentar si falla" → gateway + "Enviar solicitud" / "Reintentar"
-   "recibir número de inventario / folio / confirmación" → "Recibir confirmación"
-   "adjuntar archivo / documento" → "Adjuntar documentos" (fusionar con el paso anterior si es parte del mismo formulario)
-
-4. LO QUE SÍ VALE LA PENA SEPARAR en módulos grandes:
-   - Gateways de decisión con rutas distintas (Rechazar vs Autorizar)
-   - Pasos que requieren una persona distinta (usuario vs revisor vs autorizador)
-   - Generación de documentos de salida (vale, etiqueta, reporte)
-   - Notificaciones externas (endEventMessage)
+1. ABSTRAE, NO COPIES — captura lo distintivo de cada módulo.
+2. CUENTA NODOS antes de escribir.
+3. PASOS ADMINISTRATIVOS ESTÁNDAR → un solo nodo consolidado.
+4. LO QUE SÍ VALE SEPARAR: gateways con rutas distintas, personas distintas,
+   documentos de salida, notificaciones externas.
 
 ═══════════════════════════════════════════════════════════
-REGLA 8 — JSON COMPACTO (OBLIGATORIO)
+REGLA 9 — JSON COMPACTO (OBLIGATORIO)
 ═══════════════════════════════════════════════════════════
-Para evitar que la respuesta se trunque en manuales grandes, escribe cada step
-en UNA SOLA LÍNEA. Esto reduce el tamaño del JSON un 35-40% sin perder datos.
+Escribe cada step en UNA SOLA LÍNEA. Reduce el tamaño del JSON un 35-40%.
 
-  ✅ CORRECTO — una línea por step:
-  {"id":"Start_A","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión y menú","next":["Task_B"]}
+  ✅ CORRECTO:
+  {"id":"Task_Login","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Script_Val"],"annotation":"Usuario · Contraseña"}
 
-  ❌ INCORRECTO — múltiples líneas por step:
-  {
-    "id": "Start_A",
-    "name": "Inicio de sesión",
-    ...
-  }
-
-Aplica este formato a TODOS los steps sin excepción.
-El campo "pools" puede seguir con formato normal (son pocos elementos).
+  ❌ INCORRECTO — múltiples líneas por step.
 
 ═══════════════════════════════════════════════════════════
-REGLA 9 — CHECKLIST FINAL ANTES DE CERRAR EL JSON
+REGLA 10 — CHECKLIST FINAL ANTES DE CERRAR EL JSON
 ═══════════════════════════════════════════════════════════
-Antes de escribir [JSON_END], ejecuta este checklist mentalmente:
-
 □ ¿Cada pool tiene exactamente 1 startEvent?
 □ ¿Todos los endEvent tienen "next": []?
 □ ¿Cada intermediateEvent aparece en el "next" de al menos 1 nodo anterior?
-  → Si no → está huérfano. Conectarlo desde el último nodo del lane anterior.
-□ ¿Hay algún nodo (no startEvent) cuyo id NO aparece en ningún "next" de otro nodo?
-  → Si sí → ese nodo está desconectado. Conectarlo o eliminarlo.
-□ ¿Algún nodo no-endEvent tiene "next": [] o "next" vacío?
-  → Si sí → ese nodo es un callejón sin salida. Agregar conexión al siguiente o a endEvent.
+□ ¿Hay algún nodo (no startEvent) cuyo id NO aparece en ningún "next"?
+□ ¿Algún nodo no-endEvent tiene "next": [] o vacío?
 □ ¿Algún nodo apunta a un nodo de un pool diferente?
-  → Si sí → eliminar esa conexión. Los pools son completamente independientes.
 □ ¿Algún exclusiveGateway tiene solo 1 salida?
-  → Si sí → no es gateway, convertirlo a userTask o scriptTask.
-□ ¿Existe algún ciclo directo (A→B→A) o indirecto (A→B→C→A)?
-  → Si sí → romper el ciclo: el nodo final del ciclo debe ir a un endEvent descriptivo.
-□ ¿El número total de lanes en todos los "pools" coincide con el número
-  de valores distintos en el campo "role" de todos los steps?
-  → Si no → hay roles en steps sin lane declarado o lanes sin steps. Corregir.
+□ ¿Existe algún ciclo A→B→A?
+□ ¿Los roles de los lanes reflejan exactamente los roles del manual?
+□ ¿Las anotaciones ("annotation") solo contienen campos mencionados en el manual?
+□ ¿Los procesos de cada módulo están completos (no resumidos en exceso)?
 
 Solo cuando todos estén verificados, escribir [JSON_END].
 
 ═══════════════════════════════════════════════════════════
-EJEMPLO REAL basado en un diagrama profesional de referencia
+EJEMPLO COMPLETO — un pool, múltiples roles con anotaciones
 ═══════════════════════════════════════════════════════════
-Este ejemplo muestra el nivel de concisión, estructura y conectividad esperados.
-Observa que CADA nodo aparece referenciado en el "next" de algún nodo anterior
-(excepto los startEvent), y CADA nodo tiene salida (excepto los endEvent).
 
-Portal Ciudadano — lanes: "Pre-registro · Recuperar contraseña · Inicio de sesión y menú · Actualizar mis datos · Unidades de Salud · Mis dependientes · Cerrar sesión"
+Sistema con 2 roles: Ciudadano y Brigadista. Son apps distintas → 2 pools.
+Dentro de la Herramienta Brigadista hay 3 sub-roles: Brigadista, Director, Coordinador
+→ 1 solo pool "Herramienta Brigadista" con anotaciones de rol por lane.
 
-Lane "Inicio de sesión y menú":  ← ESTRUCTURA FIJA — siempre exactamente estos 7 nodos
-  Start("Inicio de sesión")
-  → userTask("Ingresar credenciales")
-  → scriptTask("Validar acceso")
-  → Gateway("¿Acceso correcto?") →
-      [No]  → endEvent("Acceso fallido")                ← endEvent simple: error
-      [Sí]  → userTask("Acceso a ventana principal")
-              → intermediateEventMultiple("Menú principal") →
-                  [Módulo A] [Módulo B] [Cerrar sesión]  ← hub: 1 salida por módulo + cerrar
+Pool "Portal Ciudadano" — un solo rol → sin anotaciones de rol:
+  Lane "Inicio de sesión":
+    Start → userTask("Ingresar credenciales") [annotation: "CURP · Contraseña"]
+          → scriptTask("Validar acceso") → GW("¿Acceso correcto?")
+          → [No] End("Acceso fallido")
+          → [Sí] userTask("Acceso a ventana principal") → Menú principal
 
-Lane "Mis dependientes":
-  intermediateEvent → "Ingresar CURP dependiente" → Gateway(¿CURP registrada?) →
-    [Sí]  → endEvent("CURP ya registrada")              ← endEvent simple: fin sin notif.
-    [No]  → "Confirmar datos" → "Información de contacto" → "Generar credencial"
-          → endEventSignal("Credencial generada")       ← signal: impacta sistema externo
+  Lane "Mis dependientes":
+    Evt → userTask("Acceder a mis dependientes")
+        → userTask("Buscar por CURP") [annotation: "CURP dependiente"]
+        → GW("¿CURP registrada?") → [Sí] End("CURP ya registrada")
+                                  → [No] userTask("Completar datos") [annotation: "Nombre · Parentesco · Fecha nacimiento"]
+                                       → endEventMessage("Dependiente registrado")
 
-Lane "Cerrar sesión":
-  intermediateEvent → "Confirmar cierre" → endEventTerminate("Sesión cerrada")
-                                           ← terminate: cierre de sesión SIEMPRE
+Pool "Herramienta Brigadista" — 3 sub-roles → anotaciones de rol en cada lane:
+  Lane "Inicio de sesión":
+    Start → userTask("Ingresar credenciales")
+            [annotation: "Brigadista · Director de Área · Coordinador Estatal | Usuario · Contraseña"]
+          → scriptTask("Validar acceso") → GW → Menú principal
 
-Lane "Lista de usuarios" (operación con confirmación):
-  intermediateEvent → "Nuevo usuario" → "Completar formulario" → "Confirmar registro"
-          → endEventMessage("Usuario creado")           ← message: hay confirmación visible
+  Lane "Gestión de usuarios":         ← accesible por Brigadista únicamente
+    Evt [annotation: "Rol: Brigadista"]
+      → userTask("Buscar usuario") [annotation: "CURP · Nombre"]
+      → userTask("Crear o editar usuario") [annotation: "Nombre · CURP · Región"]
+      → endEventMessage("Usuario guardado")
 
-Lane "Enviar código" (notificación dentro del flujo, no termina):
-  ... → intermediateEventMessage("Enviar código verificación") → "Ingresar código" → ...
-        ← message intermediate: el flujo CONTINÚA después de enviar
+  Lane "Aprobar solicitudes":         ← accesible por Director y Coordinador
+    Evt [annotation: "Rol: Director de Área · Coordinador Estatal"]
+      → userTask("Consultar solicitudes pendientes")
+      → userTask("Revisar y aprobar") → endEventMessage("Solicitud aprobada")
+
+  Lane "Cerrar sesión":
+    Evt → userTask("Confirmar cierre") → endEventTerminate("Sesión cerrada")
 
 [MD_START]
-**Usuarios identificados:** lista de tipos de usuario
+**Sistema analizado:** nombre del sistema
+**Roles identificados:** lista de roles EXACTOS del manual
 **Lanes:** lista completa en orden
 **Pasos totales:** número
 **Flujo general:** 2-3 líneas resumiendo el proceso
@@ -961,36 +1019,25 @@ Lane "Enviar código" (notificación dentro del flujo, no termina):
 [JSON_START]
 {
   "pools": [
-    { "name": "Sistema X - Proceso A", "roles": ["Inicio de sesión Ciudadano", "Módulo A", "Cerrar sesión Ciudadano"] },
-    { "name": "Sistema X - Proceso B", "roles": ["Inicio de sesión Brigadista", "Módulo B", "Cerrar sesión Brigadista"] }
+    { "name": "Nombre Exacto del Sistema - Rol del Manual", "roles": ["Inicio de sesión RolReal", "Módulo A", "Cerrar sesión RolReal"] }
   ],
   "steps": [
-    {"id":"Start_A","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Ciudadano","next":["Task_Cred"]},
-    {"id":"Task_Cred","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Script_Val"]},
-    {"id":"Script_Val","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión Ciudadano","next":["GW_Login"]},
-    {"id":"GW_Login","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión Ciudadano","next":["End_Fallo","Task_Menu"],"conditions":{"End_Fallo":"No","Task_Menu":"Sí"}},
-    {"id":"End_Fallo","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión Ciudadano","next":[]},
-    {"id":"Task_Menu","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Ciudadano","next":["Evt_Modulos"]},
-    {"id":"Evt_Modulos","name":"Módulos","type":"intermediateEventMultiple","role":"Inicio de sesión Ciudadano","next":["Evt_ModA","Evt_Cerrar"]},
-    {"id":"Evt_ModA","name":"Módulo A","type":"intermediateEvent","role":"Módulo A","next":["Task_AccionA"]},
-    {"id":"Task_AccionA","name":"Ejecutar acción A","type":"userTask","role":"Módulo A","next":["End_ModA"]},
-    {"id":"End_ModA","name":"Operación realizada","type":"endEventMessage","role":"Módulo A","next":[]},
-    {"id":"Evt_Cerrar","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Ciudadano","next":["Task_Cerrar"]},
-    {"id":"Task_Cerrar","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Ciudadano","next":["End_Sesion"]},
-    {"id":"End_Sesion","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión Ciudadano","next":[]},
-    {"id":"Start_B","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión Brigadista","next":["Task_CredB"]},
-    {"id":"Task_CredB","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión Brigadista","next":["Script_ValB"]},
-    {"id":"Script_ValB","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión Brigadista","next":["GW_LoginB"]},
-    {"id":"GW_LoginB","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión Brigadista","next":["End_FalloB","Task_MenuB"],"conditions":{"End_FalloB":"No","Task_MenuB":"Sí"}},
-    {"id":"End_FalloB","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión Brigadista","next":[]},
-    {"id":"Task_MenuB","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión Brigadista","next":["Evt_ModulosB"]},
-    {"id":"Evt_ModulosB","name":"Menú principal Brigadista","type":"intermediateEventMultiple","role":"Inicio de sesión Brigadista","next":["Evt_ModB","Evt_CerrarB"]},
-    {"id":"Evt_ModB","name":"Módulo B","type":"intermediateEvent","role":"Módulo B","next":["Task_AccionB"]},
-    {"id":"Task_AccionB","name":"Ejecutar acción B","type":"userTask","role":"Módulo B","next":["End_ModB"]},
-    {"id":"End_ModB","name":"Operación realizada","type":"endEventMessage","role":"Módulo B","next":[]},
-    {"id":"Evt_CerrarB","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión Brigadista","next":["Task_CerrarB"]},
-    {"id":"Task_CerrarB","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión Brigadista","next":["End_SesionB"]},
-    {"id":"End_SesionB","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión Brigadista","next":[]}
+    {"id":"Start_A","name":"Inicio de sesión","type":"startEvent","role":"Inicio de sesión RolReal","next":["Task_Cred"]},
+    {"id":"Task_Cred","name":"Ingresar credenciales","type":"userTask","role":"Inicio de sesión RolReal","next":["Script_Val"],"annotation":"Usuario · Contraseña"},
+    {"id":"Script_Val","name":"Validar acceso","type":"scriptTask","role":"Inicio de sesión RolReal","next":["GW_Login"]},
+    {"id":"GW_Login","name":"¿Acceso correcto?","type":"exclusiveGateway","role":"Inicio de sesión RolReal","next":["End_Fallo","Task_Menu"],"conditions":{"End_Fallo":"No","Task_Menu":"Sí"}},
+    {"id":"End_Fallo","name":"Acceso fallido","type":"endEvent","role":"Inicio de sesión RolReal","next":[]},
+    {"id":"Task_Menu","name":"Acceso a ventana principal","type":"userTask","role":"Inicio de sesión RolReal","next":["Evt_Modulos"]},
+    {"id":"Evt_Modulos","name":"Menú principal","type":"intermediateEventMultiple","role":"Inicio de sesión RolReal","next":["Evt_ModA","Evt_Cerrar"]},
+    {"id":"Evt_ModA","name":"Módulo A","type":"intermediateEvent","role":"Módulo A","next":["Task_AccederA"]},
+    {"id":"Task_AccederA","name":"Acceder a módulo A","type":"userTask","role":"Módulo A","next":["Task_BuscarA"]},
+    {"id":"Task_BuscarA","name":"Buscar por folio","type":"userTask","role":"Módulo A","next":["Task_SeleccionarA"],"annotation":"Folio · Fecha"},
+    {"id":"Task_SeleccionarA","name":"Seleccionar registro","type":"userTask","role":"Módulo A","next":["Task_EditarA"]},
+    {"id":"Task_EditarA","name":"Completar formulario","type":"userTask","role":"Módulo A","next":["End_ModA"],"annotation":"Campo 1 · Campo 2 · Campo 3"},
+    {"id":"End_ModA","name":"Operación completada","type":"endEventMessage","role":"Módulo A","next":[]},
+    {"id":"Evt_Cerrar","name":"Cerrar sesión","type":"intermediateEvent","role":"Cerrar sesión RolReal","next":["Task_Cerrar"]},
+    {"id":"Task_Cerrar","name":"Confirmar cierre","type":"userTask","role":"Cerrar sesión RolReal","next":["End_Sesion"]},
+    {"id":"End_Sesion","name":"Sesión cerrada","type":"endEventTerminate","role":"Cerrar sesión RolReal","next":[]}
   ]
 }
 [JSON_END]
@@ -1047,10 +1094,10 @@ app.post('/analyze', (req, res, next) => {
                     geminiFileUri = fileData.file?.uri;
                     console.log(`✓ PDF subido a File API: ${geminiFileUri}`);
                 } else {
-                    console.error(`⚠️  File API falló (${uploadRes.status}) — el manual será truncado a ${CONFIG.maxPdfChars} chars.`);
+                    console.error(`⚠️  File API falló (${uploadRes.status}) — texto truncado a ${CONFIG.maxPdfChars} chars.`);
                 }
             } catch (e) {
-                console.error(`⚠️  File API error: ${e.message} — el manual será truncado a ${CONFIG.maxPdfChars} chars.`);
+                console.error(`⚠️  File API error: ${e.message} — texto truncado a ${CONFIG.maxPdfChars} chars.`);
             }
         }
 
@@ -1094,14 +1141,11 @@ app.post('/analyze', (req, res, next) => {
         const jsonMatch = raw.match(/\[JSON_START\]([\s\S]*?)\[JSON_END\]/);
         let rawJson = jsonMatch ? jsonMatch[1] : null;
 
-        // ✅ FIX DIAGRAMAS GRANDES: si el JSON fue truncado, hacer una segunda llamada
-        // pidiendo a Gemini que continúe exactamente desde donde se cortó.
         if (!rawJson) {
             const partial = raw.match(/\[JSON_START\]([\s\S]*)/);
             if (partial) {
                 console.warn('Respuesta truncada — solicitando continuación a Gemini...');
                 const partialJson = partial[1].trim();
-                // Construir prompt de continuación con el JSON parcial
                 const continuationPrompt = `El JSON anterior fue cortado por límite de tokens. Continúa EXACTAMENTE desde donde se cortó, sin repetir nada de lo anterior. Escribe SOLO la continuación del JSON (el fragmento que falta) y termina con [JSON_END].
 
 JSON parcial hasta donde llegaste:
@@ -1111,7 +1155,6 @@ Continúa a partir de aquí:`;
                 try {
                     const raw2 = await callGemini(continuationPrompt);
                     console.log(`Continuación recibida (${raw2.length} chars)`);
-                    // Extraer la continuación — puede tener [JSON_END] o no
                     const cont = raw2.replace(/\[JSON_END\].*$/s, '').trim();
                     rawJson = partialJson + '\n' + cont;
                     console.warn('JSON reconstruido por continuación.');
@@ -1169,20 +1212,35 @@ Continúa a partir de aquí:`;
             console.warn('PRE-FIX roles: ' + structure.roles.length + ' roles tras normalización');
         }
 
-        // FIX 0: AUTO-SPLIT lanes con > 7 nodos lineales
+        // FIX 0: AUTO-SPLIT lanes con > 7 nodos
         {
             const MAX_LANE_NODES = 7;
             const bridgeIds = new Set();
-            let pass = 0, changed = true;
-            while (changed && pass < 10) {
-                changed = false; pass++;
-                {
-                    const seen = new Set();
-                    structure.steps = structure.steps.filter(s => {
-                        if (seen.has(s.id)) return false;
-                        seen.add(s.id); return true;
-                    });
+            const isEndType0 = t => ['endEvent','endEventMessage','endEventTerminate','endEventSignal'].includes(t);
+
+            // Divide en grupos de máx maxSize, sin cortar justo en un gateway
+            const splitSmart = (arr, maxSize) => {
+                if (arr.length <= maxSize) return [arr];
+                const groups = [];
+                let i = 0;
+                while (i < arr.length) {
+                    let end = Math.min(i + maxSize, arr.length);
+                    // Retroceder si el último del grupo es gateway y aún hay más
+                    if (end < arr.length && arr[end - 1]?.type?.includes('Gateway')) end--;
+                    if (end <= i) end = i + 1; // garantizar avance mínimo
+                    groups.push(arr.slice(i, end));
+                    i = end;
                 }
+                return groups;
+            };
+
+            let pass = 0;
+            let anyChanged = true;
+            while (anyChanged && pass < 20) {
+                anyChanged = false; pass++;
+                // dedup
+                { const seen = new Set(); structure.steps = structure.steps.filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true; }); }
+
                 const newRoles = [], newSteps = [];
                 structure.roles.forEach((role, roleIdx) => {
                     const laneSteps = structure.steps.filter(s => s.role === role);
@@ -1190,52 +1248,58 @@ Continúa a partir de aquí:`;
                     if (realCount <= MAX_LANE_NODES) {
                         newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return;
                     }
-                    const laneIds = new Set(laneSteps.map(s => s.id));
-                    const laneIdxMap = {};
-                    laneSteps.forEach((s, i) => { laneIdxMap[s.id] = i; });
-                    let hasCycle = false;
-                    laneSteps.forEach(s => {
-                        (s.next || []).forEach(nid => {
-                            if (laneIds.has(nid) && laneIdxMap[nid] < laneIdxMap[s.id]) hasCycle = true;
+
+                    anyChanged = true;
+                    const base    = role.replace(/\s*-\s*Parte\s*[\d.]+$/i, '').trim();
+                    const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 14);
+
+                    const realSteps   = laneSteps.filter(s => !bridgeIds.has(s.id));
+                    const bridgeSteps = laneSteps.filter(s =>  bridgeIds.has(s.id));
+                    const groups      = splitSmart(realSteps, MAX_LANE_NODES);
+                    const partNames   = groups.map((_, gi) => `${base} - Parte ${roleIdx}.${gi + 1}`);
+
+                    // Reasignar roles a cada grupo
+                    groups.forEach((grp, gi) => grp.forEach(s => { s.role = partNames[gi]; }));
+
+                    // Crear bridges entre grupos consecutivos
+                    const newBridges = [];
+                    for (let gi = 0; gi < groups.length - 1; gi++) {
+                        const grp     = groups[gi];
+                        const nextGrp = groups[gi + 1];
+                        const bid     = `EvtBr_${safeBase}_${pass}_${gi}`;
+                        const firstReal = nextGrp.find(s => !isEndType0(s.type));
+                        if (!firstReal) continue;
+
+                        bridgeIds.add(bid);
+                        newBridges.push({
+                            afterGroup: gi,
+                            bridge: { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: partNames[gi + 1], next: [firstReal.id] }
                         });
+
+                        const lastActive = [...grp].reverse().find(s => !isEndType0(s.type));
+                        if (lastActive) {
+                            if (!(lastActive.next || []).includes(bid))
+                                lastActive.next = [...(lastActive.next || []), bid];
+                            // Quitar conexiones directas al siguiente grupo (pasan por el bridge)
+                            lastActive.next = lastActive.next.filter(nid =>
+                                nid === bid || !nextGrp.some(s => s.id === nid)
+                            );
+                        }
+                    }
+
+                    bridgeSteps.forEach(s => { s.role = partNames[0]; });
+                    partNames.forEach((pn, gi) => {
+                        newRoles.push(pn);
+                        if (gi === 0) bridgeSteps.forEach(s => newSteps.push(s));
+                        groups[gi].forEach(s => newSteps.push(s));
+                        const b = newBridges.find(b => b.afterGroup === gi);
+                        if (b) newSteps.push(b.bridge);
                     });
-                    if (hasCycle) { newRoles.push(role); laneSteps.forEach(s => newSteps.push(s)); return; }
-                    changed = true;
-                    const base = role.replace(/\s*-\s*Parte\s*[\d\.]+$/i, '').trim();
-                    const p1n = `${base} - Parte ${roleIdx}.1`, p2n = `${base} - Parte ${roleIdx}.2`;
-                    const p1s = laneSteps.slice(0, MAX_LANE_NODES), p2s = laneSteps.slice(MAX_LANE_NODES);
-                    const safeBase = base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
-                    const bid = `EvtBr_${safeBase}_${pass}`;
 
-                    // El target del bridge debe ser un nodo con proceso real (no endEvent).
-                    // Si p2s[0] es endEvent el bridge quedaría vacío (EvtBr→endEvent sin tareas).
-                    const isEndType = t => t === 'endEvent' || t === 'endEventMessage' ||
-                                          t === 'endEventTerminate' || t === 'endEventSignal';
-                    const bridgeTarget = p2s.find(s => !isEndType(s.type));
-                    if (!bridgeTarget) {
-                        // p2s solo tiene endEvents — no tiene sentido dividir este lane
-                        console.warn(`FIX0: lane "${role}" p2s sin nodos activos, split omitido`);
-                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s));
-                        changed = false; return;
-                    }
-
-                    bridgeIds.add(bid);
-                    const bridge = { id: bid, name: `Continuar ${base.split(' ').slice(-2).join(' ')}`, type: 'intermediateEvent', role: p2n, next: [bridgeTarget.id] };
-                    const lastConnectable = [...p1s].reverse().find(s => !isEndType(s.type));
-                    if (lastConnectable && !(lastConnectable.next || []).includes(bid)) {
-                        lastConnectable.next = [...(lastConnectable.next || []), bid];
-                    } else if (!lastConnectable) {
-                        console.warn(`FIX0: lane "${role}" todos endEvents, bridge omitido`);
-                        bridgeIds.delete(bid);
-                        newRoles.push(role); laneSteps.forEach(s => newSteps.push(s));
-                        changed = false; return;
-                    }
-                    p1s.forEach(s => { s.role = p1n; }); p2s.forEach(s => { s.role = p2n; });
-                    newRoles.push(p1n, p2n);
-                    p1s.forEach(s => newSteps.push(s)); newSteps.push(bridge); p2s.forEach(s => newSteps.push(s));
-                    console.warn(`FIX0: "${role}" → "${p1n}" + "${p2n}"`);
+                    console.warn(`FIX0: "${role}" → ${groups.length} partes (${realCount} nodos)`);
                 });
-                if (changed) {
+
+                if (anyChanged) {
                     structure.roles = newRoles;
                     structure.steps = newSteps;
                     if (structure.pools?.length) {
@@ -1245,13 +1309,65 @@ Continúa a partir de aquí:`;
                                 const replacements = newRoles.filter(nr =>
                                     nr === origRole || nr.startsWith(origRole + ' - Parte ')
                                 );
-                                if (replacements.length) updated.push(...replacements);
-                                else updated.push(origRole);
+                                updated.push(...(replacements.length ? replacements : [origRole]));
                             });
                             pool.roles = [...new Set(updated)];
                         });
-                        console.warn('FIX0-pools: structure.pools actualizado con roles divididos');
+                        console.warn('FIX0-pools: actualizado');
                     }
+                }
+            }
+        }
+
+        // FIX 0c: FUSIONAR lanes de "Parte X.N" que solo contienen endEvents
+        // Esto ocurre cuando el FIX 0 corta justo antes de un endEvent de rama de error,
+        // dejando ese endEvent solo en un lane separado. Se fusiona de vuelta al lane anterior.
+        {
+            const isEndType = t => ['endEvent','endEventMessage','endEventTerminate','endEventSignal'].includes(t);
+            let fusionChanged = true;
+            while (fusionChanged) {
+                fusionChanged = false;
+                const rolesLocal = [...structure.roles];
+                for (let ri = 1; ri < rolesLocal.length; ri++) {
+                    const role = rolesLocal[ri];
+                    const laneSteps = structure.steps.filter(s => s.role === role);
+                    // Solo fusionar si TODOS los steps del lane son endEvents (ninguna tarea real)
+                    const allEnds = laneSteps.length > 0 && laneSteps.every(s => isEndType(s.type));
+                    if (!allEnds) continue;
+                    // Buscar el lane anterior (Parte X.N-1) — debe ser un split del mismo módulo
+                    const prevRole = rolesLocal[ri - 1];
+                    const baseMatch = role.match(/^(.+)\s*-\s*Parte\s+[\d.]+$/i);
+                    const prevMatch = prevRole.match(/^(.+)\s*-\s*Parte\s+[\d.]+$/i);
+                    const sameBase = baseMatch && prevMatch &&
+                        baseMatch[1].trim() === prevMatch[1].trim();
+                    if (!sameBase) continue;
+                    // Fusionar: mover los endEvents al lane anterior
+                    laneSteps.forEach(s => { s.role = prevRole; });
+                    structure.roles = structure.roles.filter(r => r !== role);
+                    if (structure.pools?.length) {
+                        structure.pools.forEach(pool => {
+                            pool.roles = pool.roles.filter(r => r !== role);
+                        });
+                    }
+                    console.warn(`FIX0c: fusionado "${role}" → "${prevRole}" (solo endEvents)`);
+                    fusionChanged = true;
+                    break; // Reiniciar el while con la lista actualizada
+                }
+            }
+        }
+
+        // FIX 0b: ELIMINAR lanes vacíos (sin ningún step asignado)
+        {
+            const rolesConSteps = new Set(structure.steps.map(s => s.role));
+            const rolesFiltrados = structure.roles.filter(r => rolesConSteps.has(r));
+            const eliminados = structure.roles.filter(r => !rolesConSteps.has(r));
+            if (eliminados.length) {
+                console.warn(`FIX0b: ${eliminados.length} lane(s) vacíos eliminados: ${eliminados.join(', ')}`);
+                structure.roles = rolesFiltrados;
+                if (structure.pools?.length) {
+                    structure.pools.forEach(pool => {
+                        pool.roles = (pool.roles || []).filter(r => rolesConSteps.has(r));
+                    });
                 }
             }
         }
@@ -1281,12 +1397,18 @@ Continúa a partir de aquí:`;
 
         // FIX 2: referencias inexistentes
         structure.steps.forEach(step => {
-            step.next = (step.next || []).filter(nid => { if (!validIds.has(nid)) { console.warn(`FIX2: ${step.id}→${nid} eliminado`); return false; } return true; });
+            step.next = (step.next || []).filter(nid => {
+                if (!validIds.has(nid)) { console.warn(`FIX2: ${step.id}→${nid} eliminado`); return false; }
+                return true;
+            });
         });
 
         // FIX 3: roles desconocidos
         structure.steps.forEach(step => {
-            if (!structure.roles.includes(step.role)) { console.warn(`FIX3: rol desconocido "${step.role}"`); step.role = structure.roles[0]; }
+            if (!structure.roles.includes(step.role)) {
+                console.warn(`FIX3: rol desconocido "${step.role}"`);
+                step.role = structure.roles[0];
+            }
         });
 
         // FIX 4: gateway sin salidas
@@ -1308,7 +1430,7 @@ Continúa a partir de aquí:`;
 
         // FIX 5: nodos huérfanos
         {
-            const hub = structure.steps.find(s => s.type === 'intermediateEvent' && (s.next || []).length > 1);
+            const hub = structure.steps.find(s => s.type === 'intermediateEventMultiple');
             structure.roles.forEach((role, ri) => {
                 if (ri === 0) return;
                 const laneSteps = structure.steps.filter(s => s.role === role);
@@ -1317,8 +1439,7 @@ Continúa a partir de aquí:`;
                 const isEndType = t => t === 'endEvent' || t === 'endEventMessage' ||
                                        t === 'endEventTerminate' || t === 'endEventSignal';
                 const orphans = laneSteps.filter(s =>
-                    !currentTargets.has(s.id) &&
-                    !isEndType(s.type)
+                    !currentTargets.has(s.id) && !isEndType(s.type)
                 );
                 orphans.forEach(orphan => {
                     const updatedTargets = new Set(structure.steps.flatMap(s => s.next || []));
