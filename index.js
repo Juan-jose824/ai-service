@@ -14,6 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '150mb' }));
 
+// COnfirguración de multer para manejo de archivos PDF en memoria, con limite de 50 MB y filtro para aceptar solo PDFs.
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 },
@@ -25,8 +26,11 @@ const upload = multer({
         }
     },
 });
+
+// Inicialización del cliente de Google Generative AI con la clave API proporcionada en las variables de entorno.
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Configuración de parámetros para las llamadas al modelo de lenguaje, incluyendo el modelo a usar, limites de caracteres, tokens y tiempo de espera.
 const CONFIG = {
     model:       'gemini-2.5-flash',
     maxPdfChars: 280_000,
@@ -35,6 +39,7 @@ const CONFIG = {
     timeout:     180_000,
 };
 
+// Función para escapar caracteres especiales en XML, asegurando que el texto se renderice correctamente en el diagrama BPMN.
 function xmlEscape(str) {
     return (str || '')
         .replace(/&/g,  '&amp;')
@@ -45,7 +50,7 @@ function xmlEscape(str) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateLogic
+// generateLogic — genera la sección <process> del BPMN a partir de la estructura detectada
 // ─────────────────────────────────────────────────────────────────────────────
 function generateLogic(structure, processId, lanePrefix = '') {
     const { roles, steps } = structure;
@@ -97,7 +102,7 @@ function generateLogic(structure, processId, lanePrefix = '') {
         return xml;
     }).join('\n');
 
-    // ── ANOTACIONES (textAnnotation + association) ────────────────────────────
+    // Anotaciones de rol por sección — renderizadas como textAnnotation conectadas al primer nodo del lane
     const annotationElements = [];
     steps.forEach(step => {
         if (!step.annotation) return;
@@ -111,7 +116,7 @@ function generateLogic(structure, processId, lanePrefix = '') {
         );
     });
 
-    // helper local para sid en anotaciones
+    // SECUENCIAS helper local para sid en anotaciones
     function sid(step) { return `${pfx}${step.id}`; }
 
     const sequences = steps.flatMap(step =>
@@ -132,7 +137,7 @@ ${sequences}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateDI — layout profesional
+// generateDI — genera las secciones <bpmndi:BPMNDiagram> y <bpmndi:BPMNPlane> con posiciones calculadas para cada nodo, pool, lane y edges con routing profesional
 // ─────────────────────────────────────────────────────────────────────────────
 function generateDI(structure, processId, poolOpts = {}) {
     const { roles, steps } = structure;
@@ -169,6 +174,7 @@ function generateDI(structure, processId, poolOpts = {}) {
     const GAP_GC  = 60;
     const GAP_GG  = 65;
 
+    // Función para calcular el gap horizontal recomendado entre dos nodos según sus tipos, considerando combinaciones de eventos, tareas y gateways para optimizar el espacio visual y evitar encimamientos.
     function getGap(srcType, tgtType) {
         const sc = isCircle(srcType), sg = isGW(srcType);
         const tc = isCircle(tgtType), tg = isGW(tgtType);
@@ -183,6 +189,7 @@ function generateDI(structure, processId, poolOpts = {}) {
         return GAP_TT;
     }
 
+    // Constantes de dimensiones y posiciones base para el pool, lanes y labels, que sirven como referencia para calcular las posiciones de cada nodo y el tamaño total del diagrama.
     const POOL_LABEL_W = 30;
     const LANE_LABEL_W = 50;
     const POOL_X       = 160;
@@ -238,6 +245,7 @@ function generateDI(structure, processId, poolOpts = {}) {
             });
         });
 
+        // BFS para asignar columnas, partiendo de nodos sin predecesores (inDeg=0) y evitando back edges para no romper ciclos intencionales.
         const queue = ls.filter(s => inDeg[s.id] === 0).map(s => s.id);
         if (!queue.length) queue.push(ls[0].id);
         const visited = new Set();
@@ -398,7 +406,7 @@ function generateDI(structure, processId, poolOpts = {}) {
         .map(([x, y]) => `        <di:waypoint x="${Math.round(x)}" y="${Math.round(y)}"/>`)
         .join('\n');
 
-    // ── SHAPES ────────────────────────────────────────────────────────────────
+    // ── SHAPES — posición y tamaño de cada nodo, pool y lane ─────────────────────────
     let shapes = `      <bpmndi:BPMNShape id="${POOL_ID}_di" bpmnElement="${POOL_ID}" isHorizontal="true">
         <dc:Bounds x="${POOL_X}" y="${POOL_Y}" width="${poolW}" height="${poolH}"/>
       </bpmndi:BPMNShape>\n`;
@@ -438,7 +446,10 @@ function generateDI(structure, processId, poolOpts = {}) {
       </bpmndi:BPMNShape>\n`;
     });
 
-    // ── EDGES — routing profesional ───────────────────────────────────────────
+    /* ── EDGES — rutas entre nodos con cálculo profesional de waypoints para evitar cruces y encimamientos, 
+    considerando la posición relativa de los nodos (misma fila, misma columna, diferentes lanes) y el tipo de 
+    conexión (condicional o no).
+    */
     let edges = '';
 
     steps.forEach(step => {
@@ -536,6 +547,7 @@ function generateDI(structure, processId, poolOpts = {}) {
                 }
             }
 
+            // Si la conexión tiene una condición, agregar un label con el texto de la condición cerca del nodo de origen, evitando cruces con la línea.
             let labelXml = '';
             if (condText) {
                 const labelW = Math.min(condText.length * 7 + 12, 100);
@@ -550,7 +562,9 @@ ${wpt(pts)}
         });
     });
 
-    // ── EDGES de asociaciones de anotaciones ──────────────────────────────────
+    /* Edges de anotaciones — conectar cada anotación con su nodo correspondiente usando una línea recta desde el centro 
+    inferior de la anotación al centro superior del nodo, asegurando que el texto de la anotación no cruce con la línea.
+    */
     steps.forEach(s => {
         if (!s.annotation) return;
         const p = P(s.id);
@@ -571,7 +585,12 @@ ${wpt(pts)}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// buildPrompt — con los 3 cambios solicitados
+/*
+buildPrompt — genera el prompt completo para la generación del diagrama BPMN, incluyendo instrucciones detalladas sobre la 
+filosofía de diseño, reglas de representación de roles y módulos, y pasos previos obligatorios para asegurar que el 
+diagrama sea claro, completo y profesional, listo para ser presentado a un director de área sin necesidad de explicación 
+adicional.
+*/
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPrompt(text) {
     return `Eres un analista de procesos BPMN experto. Tu objetivo es generar diagramas claros, concisos y profesionales — listos para ser presentados a un director de área sin explicación adicional.
@@ -1046,6 +1065,7 @@ MANUAL A ANALIZAR:
 ${text}`;
 }
 
+
 function multerErrorHandler(err, req, res, next) {
     if (err && err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'El archivo es demasiado grande. Máximo 50 MB.' });
     if (err) return res.status(400).json({ error: err.message || 'Error al procesar el archivo.' });
@@ -1068,6 +1088,7 @@ app.post('/analyze', (req, res, next) => {
             return res.status(400).json({ error: 'No se pudo leer el PDF.' });
         }
 
+        // Limpiar el texto: eliminar saltos de línea, tabs y espacios extras, y truncar a un máximo de caracteres para evitar saturar a Gemini.
         const rawText    = pdfData.text.replace(/\s+/g, ' ').trim();
         const manualText = rawText.substring(0, CONFIG.maxPdfChars);
         if (manualText.length < 100) return res.status(400).json({ error: 'El PDF no contiene texto extraíble.' });
@@ -1076,6 +1097,8 @@ app.post('/analyze', (req, res, next) => {
         const USE_FILE_API = req.file.size > 500 * 1024;
         if (USE_FILE_API) {
             try {
+
+                // Subir el PDF a la File API de Gemini para que pueda procesarlo sin saturar el prompt.
                 const uploadRes = await fetch(
                     `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`,
                     {
@@ -1101,6 +1124,10 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
+        /*
+        Si el PDF es pequeño o la File API falla, se envía el texto completo (o truncado) en el prompt. 
+        Gemini puede manejar hasta 100k chars, pero se recomienda mantenerlo por debajo de 50k para evitar saturación.
+        */
         console.log(`PDF: ${req.file.size} bytes, ${pdfData.numpages} pág.`);
         const t0 = Date.now();
 
@@ -1109,6 +1136,7 @@ app.post('/analyze', (req, res, next) => {
             generationConfig: { temperature: CONFIG.temperature, maxOutputTokens: CONFIG.maxTokens },
         });
 
+        // Función para llamar a Gemini con reintentos exponenciales en caso de errores 503 o 429.
         async function callGemini(promptText) {
             for (let attempt = 0; attempt < 4; attempt++) {
                 try {
@@ -1134,6 +1162,7 @@ app.post('/analyze', (req, res, next) => {
             }
         }
 
+        // Construir el prompt con el manual y las instrucciones, y llamar a Gemini.
         const raw = await callGemini(buildPrompt(manualText));
         console.log(`Gemini respondió en ${((Date.now() - t0)/1000).toFixed(1)}s`);
 
@@ -1166,6 +1195,7 @@ Continúa a partir de aquí:`;
         }
         if (!rawJson) throw new Error('Gemini no devolvió JSON válido. Intenta de nuevo.');
 
+        // Limpiar el JSON de código innecesario, comentarios y comas finales, y parsear.
         let structure;
         try {
             let js = rawJson.replace(/```json|```/g, '').trim();
@@ -1187,6 +1217,7 @@ Continúa a partir de aquí:`;
 
         const validIds = new Set(structure.steps.map(s => s.id));
 
+        // FIX 1: Normalizar roles que aparecen en múltiples pools (caso común en manuales con muchos roles y pocos módulos, donde cada pool reclama un rol genérico como "Usuario").
         if (structure.pools?.length > 1) {
             const rolePoolIdx = {};
             structure.pools.forEach((pool, pi) => {
@@ -1212,7 +1243,7 @@ Continúa a partir de aquí:`;
             console.warn('PRE-FIX roles: ' + structure.roles.length + ' roles tras normalización');
         }
 
-        // FIX 0: AUTO-SPLIT lanes con > 7 nodos
+        // FIX 0: DIVIDIR lanes con más de 7 nodos en sub-lanes conectados por intermediateEvents puente (bridges).
         {
             const MAX_LANE_NODES = 7;
             const bridgeIds = new Set();
@@ -1508,7 +1539,7 @@ Continúa a partir de aquí:`;
             });
         }
 
-        // ─── ENSAMBLADO GENÉRICO DE N POOLS ────────────────────────────────
+        // FIX 7: pasos con múltiples roles (asignar al rol más frecuente, o al primero si hay empate)
         {
             const allSteps = structure.steps;
             const ts = Date.now();
@@ -1551,6 +1582,8 @@ Continúa a partir de aquí:`;
                 currentY += di.poolH + 60;
             });
 
+
+            // Combinar todas las partes de DI (shapes y edges) en una sola sección de BPMNDiagram.
             const allShapes = diParts.map(d => d.shapesXml).join('');
             const allEdges  = diParts.map(d => d.edgesXml).join('');
 
@@ -1600,6 +1633,7 @@ ${diXml}
     }
 });
 
+// Iniciar el servidor en el puerto 4000 y configurar los timeouts para evitar desconexiones prematuras durante análisis largos.
 const server = app.listen(4000, () => console.log(`Servidor IA en puerto 4000 — modelo: ${CONFIG.model}`));
 server.timeout = CONFIG.timeout;
 server.keepAliveTimeout = CONFIG.timeout;
